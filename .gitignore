@@ -1,0 +1,9 @@
+bin/
+*.wrapped
+*.pem
+*.key
+pin
+.env
+coverage.out
+.DS_Store
+.omc/

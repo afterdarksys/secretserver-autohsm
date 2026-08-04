@@ -1,0 +1,48 @@
+# autohsm configuration — install at /etc/autohsm/autohsm.yaml with mode 0600.
+# The daemon refuses to start if the mode is anything else: this file may hold
+# an HSM PIN.
+
+# Identifies this host. Bound into every wrapped share, so a share wrapped for
+# this node cannot be unwrapped anywhere else. Changing it invalidates the
+# node's shares — re-wrap them if you rename a host.
+node_id: apps2
+
+vault:
+  # Must be https. There is no plaintext option: shares cross the network.
+  address: https://apps2.afterdarksys.com:8200
+  # The CA (or self-signed leaf) that signs Vault's certificate. Required —
+  # there is deliberately no fallback to the system trust store.
+  ca_cert_path: /etc/autohsm/vault-ca.pem
+  timeout: 10s
+  # Set false only for a Vault that cannot negotiate TLS 1.3.
+  require_tls13: true
+
+keys:
+  source: pkcs11
+
+  pkcs11:
+    module_path: /usr/lib/softhsm/libsofthsm2.so
+    token_label: autohsm          # optional; first token used if omitted
+    key_label: autohsm-wrap       # non-extractable AES-256 key on the token
+    # Exactly one PIN source. pin_env / pin_file are preferred over inline.
+    pin_env: AUTOHSM_PIN
+    # pin_file: /etc/autohsm/pin  # must be mode 0600
+    # pin: "1234"                 # discouraged
+
+  # Shares THIS node holds. Keep this list shorter than Vault's unseal
+  # threshold: if one node can reach threshold alone, compromising that node
+  # is equivalent to holding every key, and the design buys you nothing.
+  shares:
+    - index: 1
+      path: /etc/autohsm/share-1.wrapped
+
+watch:
+  interval: 30s
+  # Stop after this many consecutive unseal rejections rather than hammering
+  # Vault — usually means the shares are stale (Vault was re-initialised).
+  max_unseal_attempts: 5
+
+alarm:
+  # Optional. Must be https. Fires whenever a sealed Vault is observed, even if
+  # the unseal then succeeds — so you learn Vault restarted.
+  # webhook_url: https://alerts.afterdarksys.com/hooks/vault-sealed

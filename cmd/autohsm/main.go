@@ -1,0 +1,356 @@
+// Command autohsm keeps a HashiCorp Vault unsealed using key shares that are
+// wrapped by an HSM and bound to this specific node.
+//
+// Subcommands:
+//
+//	watch     poll Vault and unseal when sealed (the daemon; this is what systemd runs)
+//	status    print Vault's current seal state and exit (exit 2 if sealed)
+//	wrap      wrap one unseal share for this node+index, reading plaintext from stdin
+//	selftest  verify config, CA pinning, HSM login, and that every share unwraps
+package main
+
+import (
+	"bufio"
+	"context"
+	"crypto/rand"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"os"
+	"os/signal"
+	"strconv"
+	"strings"
+	"syscall"
+
+	"github.com/afterdarksys/secretserver-autohsm/internal/alarm"
+	"github.com/afterdarksys/secretserver-autohsm/internal/config"
+	"github.com/afterdarksys/secretserver-autohsm/internal/fingerprint"
+	"github.com/afterdarksys/secretserver-autohsm/internal/keysource"
+	"github.com/afterdarksys/secretserver-autohsm/internal/secure"
+	"github.com/afterdarksys/secretserver-autohsm/internal/vaultclient"
+	"github.com/afterdarksys/secretserver-autohsm/internal/watch"
+)
+
+const defaultConfigPath = "/etc/autohsm/autohsm.yaml"
+
+// exitSealed is a distinct code so external monitors can alert on "sealed"
+// without parsing output.
+const exitSealed = 2
+
+func main() {
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	if len(os.Args) < 2 {
+		usage()
+		os.Exit(1)
+	}
+	cmd := os.Args[1]
+	cfgPath := configPathFromArgs(os.Args[2:])
+
+	var err error
+	switch cmd {
+	case "watch":
+		err = runWatch(cfgPath, log)
+	case "status":
+		err = runStatus(cfgPath)
+	case "wrap":
+		err = runWrap(cfgPath, os.Args[2:])
+	case "selftest":
+		err = runSelftest(cfgPath, log)
+	case "-h", "--help", "help":
+		usage()
+		return
+	default:
+		usage()
+		os.Exit(1)
+	}
+
+	if err != nil {
+		var sealed sealedError
+		if errors.As(err, &sealed) {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(exitSealed)
+		}
+		log.Error("fatal", "error", err)
+		os.Exit(1)
+	}
+}
+
+func usage() {
+	fmt.Fprint(os.Stderr, `autohsm — keep Vault unsealed with HSM-wrapped, node-bound key shares
+
+usage:
+  autohsm watch    [--config PATH]              run the daemon (systemd entrypoint)
+  autohsm status   [--config PATH]              print seal state; exit 2 if sealed
+  autohsm wrap     [--config PATH] --index N    wrap a share read from stdin
+  autohsm selftest [--config PATH]              verify config, TLS pin, HSM, and shares
+
+default config: `+defaultConfigPath+`
+`)
+}
+
+func configPathFromArgs(args []string) string {
+	for i, a := range args {
+		if a == "--config" && i+1 < len(args) {
+			return args[i+1]
+		}
+		if strings.HasPrefix(a, "--config=") {
+			return strings.TrimPrefix(a, "--config=")
+		}
+	}
+	return defaultConfigPath
+}
+
+type sealedError struct{ msg string }
+
+func (e sealedError) Error() string { return e.msg }
+
+// build wires config into a Vault client and a key source.
+func build(cfgPath string) (*config.Config, *vaultclient.Client, keysource.Source, error) {
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	vc, err := vaultclient.New(vaultclient.Config{
+		Address:    cfg.Vault.Address,
+		CACertPath: cfg.Vault.CACertPath,
+		Timeout:    cfg.Vault.Timeout,
+		MinTLS13:   cfg.Vault.RequireTLS13 != nil && *cfg.Vault.RequireTLS13,
+	})
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	src, err := openKeySource(cfg)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return cfg, vc, src, nil
+}
+
+func openKeySource(cfg *config.Config) (keysource.Source, error) {
+	switch cfg.Keys.Source {
+	case "pkcs11":
+		pin, err := cfg.Keys.PKCS11.ResolvePIN()
+		if err != nil {
+			return nil, err
+		}
+		defer secure.Wipe(pin)
+		return keysource.OpenPKCS11(keysource.PKCS11Options{
+			ModulePath: cfg.Keys.PKCS11.ModulePath,
+			TokenLabel: cfg.Keys.PKCS11.TokenLabel,
+			KeyLabel:   cfg.Keys.PKCS11.KeyLabel,
+			PIN:        pin,
+		})
+	case "file":
+		// Development only; config.Validate already required the explicit opt-in.
+		key, err := devKeyFromEnv()
+		if err != nil {
+			return nil, err
+		}
+		defer secure.Wipe(key)
+		return keysource.NewSoftware(key)
+	default:
+		return nil, fmt.Errorf("unsupported key source %q", cfg.Keys.Source)
+	}
+}
+
+// devKeyFromEnv reads the development wrapping key. Deliberately env-only so it
+// never lands in a config file that might be committed.
+func devKeyFromEnv() ([]byte, error) {
+	const env = "AUTOHSM_DEV_KEY"
+	v := os.Getenv(env)
+	if v == "" {
+		return nil, fmt.Errorf("%s must hold a 64-char hex AES-256 key when keys.source=file", env)
+	}
+	key, err := hexDecode(v)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", env, err)
+	}
+	return key, nil
+}
+
+// randNonce returns a 12-byte GCM nonce from the OS CSPRNG. Never a counter,
+// never time-derived: a repeated nonce under the same key breaks GCM entirely.
+func randNonce() ([]byte, error) {
+	nonce := make([]byte, 12)
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return nil, fmt.Errorf("generate nonce: %w", err)
+	}
+	return nonce, nil
+}
+
+func hexDecode(s string) ([]byte, error) {
+	s = strings.TrimSpace(s)
+	if len(s) != 64 {
+		return nil, fmt.Errorf("expected 64 hex characters (32 bytes), got %d", len(s))
+	}
+	out := make([]byte, 32)
+	for i := 0; i < 32; i++ {
+		v, err := strconv.ParseUint(s[i*2:i*2+2], 16, 8)
+		if err != nil {
+			return nil, fmt.Errorf("invalid hex")
+		}
+		out[i] = byte(v)
+	}
+	return out, nil
+}
+
+func runWatch(cfgPath string, log *slog.Logger) error {
+	cfg, vc, src, err := build(cfgPath)
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+
+	notifier, err := alarm.New(cfg.Alarm.WebhookURL, log)
+	if err != nil {
+		return err
+	}
+
+	shares := make([]watch.Share, 0, len(cfg.Keys.Shares))
+	for _, s := range cfg.Keys.Shares {
+		shares = append(shares, watch.Share{Index: s.Index, Path: s.Path})
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	w := watch.New(vc, src, watch.Options{
+		NodeID:            cfg.NodeID,
+		Shares:            shares,
+		Interval:          cfg.Watch.Interval,
+		MaxUnsealAttempts: cfg.Watch.MaxUnsealAttempts,
+		Logger:            log,
+		OnSealed: func(st *vaultclient.SealStatus) {
+			notifier.SealedDetected(ctx, cfg.NodeID, st.Sealed, st.Threshold, st.Shares, st.Progress)
+		},
+	})
+
+	log.Info("autohsm watching",
+		"node", cfg.NodeID,
+		"vault", cfg.Vault.Address,
+		"shares_held", len(shares),
+		"interval", cfg.Watch.Interval.String())
+
+	err = w.Run(ctx)
+	if errors.Is(err, context.Canceled) {
+		log.Info("shutting down")
+		return nil
+	}
+	return err
+}
+
+func runStatus(cfgPath string) error {
+	_, vc, src, err := build(cfgPath)
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+
+	st, err := vc.SealStatus(context.Background())
+	if err != nil {
+		return err
+	}
+	fmt.Printf("sealed=%t initialized=%t threshold=%d shares=%d progress=%d version=%s\n",
+		st.Sealed, st.Initialized, st.Threshold, st.Shares, st.Progress, st.Version)
+	if st.Sealed {
+		return sealedError{msg: "vault is SEALED"}
+	}
+	return nil
+}
+
+// runWrap reads a plaintext unseal share from stdin and prints the wrapped
+// envelope. The plaintext is never echoed and is wiped before returning.
+func runWrap(cfgPath string, args []string) error {
+	index := 0
+	for i, a := range args {
+		if a == "--index" && i+1 < len(args) {
+			n, err := strconv.Atoi(args[i+1])
+			if err != nil {
+				return fmt.Errorf("--index must be a number")
+			}
+			index = n
+		}
+	}
+	if index < 1 {
+		return fmt.Errorf("--index N (>=1) is required: it is bound into the wrapped share")
+	}
+
+	cfg, _, src, err := build(cfgPath)
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+
+	fmt.Fprintf(os.Stderr, "reading share %d for node %q from stdin...\n", index, cfg.NodeID)
+	reader := bufio.NewReader(os.Stdin)
+	line, err := reader.ReadString('\n')
+	if err != nil && line == "" {
+		return fmt.Errorf("read share from stdin: %w", err)
+	}
+	share := []byte(strings.TrimRight(line, "\r\n"))
+	defer secure.Wipe(share)
+	if len(share) == 0 {
+		return fmt.Errorf("refusing to wrap an empty share")
+	}
+
+	aad := keysource.AAD(cfg.NodeID, index)
+
+	var envelope string
+	switch cfg.Keys.Source {
+	case "file":
+		key, kerr := devKeyFromEnv()
+		if kerr != nil {
+			return kerr
+		}
+		defer secure.Wipe(key)
+		envelope, err = keysource.WrapSoftware(key, share, aad)
+	default:
+		nonce, nerr := randNonce()
+		if nerr != nil {
+			return nerr
+		}
+		envelope, err = keysource.Wrap(src, nonce, share, aad)
+	}
+	if err != nil {
+		return err
+	}
+
+	fmt.Fprintf(os.Stderr, "wrapped share %d for node %q (%s)\n", index, cfg.NodeID, fingerprint.Of(share))
+	fmt.Println(envelope)
+	return nil
+}
+
+func runSelftest(cfgPath string, log *slog.Logger) error {
+	cfg, vc, src, err := build(cfgPath)
+	if err != nil {
+		return fmt.Errorf("config/TLS/HSM setup: %w", err)
+	}
+	defer src.Close()
+
+	log.Info("config loaded", "node", cfg.NodeID, "source", cfg.Keys.Source)
+
+	st, err := vc.SealStatus(context.Background())
+	if err != nil {
+		return fmt.Errorf("vault unreachable or CA pin wrong: %w", err)
+	}
+	log.Info("vault reachable over pinned TLS", "sealed", st.Sealed, "threshold", st.Threshold)
+
+	// Prove every configured share unwraps for THIS node before we ever need it.
+	for _, s := range cfg.Keys.Shares {
+		blob, rerr := os.ReadFile(s.Path)
+		if rerr != nil {
+			return fmt.Errorf("share %d: %w", s.Index, rerr)
+		}
+		plain, uerr := src.Unwrap(context.Background(), blob, keysource.AAD(cfg.NodeID, s.Index))
+		if uerr != nil {
+			return fmt.Errorf("share %d failed to unwrap (wrong node, index, or HSM key): %w", s.Index, uerr)
+		}
+		secure.Wipe(plain)
+		log.Info("share unwraps correctly", "index", s.Index, "blob_fp", fingerprint.Of(blob))
+	}
+
+	log.Info("selftest OK", "shares_verified", len(cfg.Keys.Shares))
+	return nil
+}

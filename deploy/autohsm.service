@@ -1,0 +1,40 @@
+[Unit]
+Description=autohsm — keep Vault unsealed with HSM-wrapped, node-bound key shares
+Documentation=https://github.com/afterdarksys/secretserver-autohsm
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/autohsm watch --config /etc/autohsm/autohsm.yaml
+
+# Restart forever: the whole point is that a reboot does not leave Vault sealed.
+Restart=always
+RestartSec=10s
+
+# The daemon reads an HSM PIN and wrapped shares; give it as little as possible.
+User=autohsm
+Group=autohsm
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=no
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=no
+RestrictSUIDSGID=yes
+RemoveIPC=yes
+
+# Config and wrapped shares are read-only to the service.
+ReadOnlyPaths=/etc/autohsm
+
+# Never write key material to a core dump.
+LimitCORE=0
+
+[Install]
+WantedBy=multi-user.target
