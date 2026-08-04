@@ -23,6 +23,9 @@ type fakeVault struct {
 	submitErr error
 	// unsealAfter submissions flips sealed to false.
 	unsealAfter int
+	// nonce identifies the current sealed episode, mirroring Vault's real
+	// seal-status "nonce" field.
+	nonce string
 }
 
 func (f *fakeVault) SealStatus(context.Context) (*vaultclient.SealStatus, error) {
@@ -31,7 +34,7 @@ func (f *fakeVault) SealStatus(context.Context) (*vaultclient.SealStatus, error)
 	if f.statusErr != nil {
 		return nil, f.statusErr
 	}
-	return &vaultclient.SealStatus{Sealed: f.sealed, Initialized: f.initted, Threshold: 3, Shares: 5, Progress: len(f.submitted)}, nil
+	return &vaultclient.SealStatus{Sealed: f.sealed, Initialized: f.initted, Threshold: 3, Shares: 5, Progress: len(f.submitted), Nonce: f.nonce}, nil
 }
 
 func (f *fakeVault) SubmitUnsealShare(_ context.Context, share []byte) (*vaultclient.SealStatus, error) {
@@ -187,6 +190,44 @@ func TestMalformedSubmissionStateIsTerminal(t *testing.T) {
 	}
 }
 
+// Regression: a stale submission latch from a prior sealed episode must not
+// suppress our share in a NEW episode, even when that episode's Progress is
+// already nonzero because a peer contributed before our next poll. Relying
+// on Progress==0 alone would leave this node believing it has nothing left
+// to submit for an episode it never actually acted in -- a deadlock if no
+// other peer covers this node's share.
+func TestStaleLatchClearsOnNonceChangeEvenWithNonzeroProgress(t *testing.T) {
+	src, path := setup(t, "apps2", 1, "share-one")
+	statePath := filepath.Join(t.TempDir(), "submitted")
+	v := &fakeVault{sealed: true, initted: true, nonce: "episode-A"}
+	opts := Options{
+		NodeID: "apps2", Shares: []Share{{Index: 1, Path: path}}, StatePath: statePath, Logger: quietLogger(),
+	}
+
+	// Episode A: this node submits its share; the latch (and nonce) persist.
+	if err := New(v, src, opts).Tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(v.submitted); got != 1 {
+		t.Fatalf("episode A: got %d submissions, want 1", got)
+	}
+
+	// Simulate a daemon restart racing a reseal we never directly observed: a
+	// new episode begins (fresh nonce) and a peer has already contributed,
+	// so Progress is nonzero going into our very first poll of episode B.
+	v.mu.Lock()
+	v.nonce = "episode-B"
+	v.submitted = [][]byte{[]byte("peer-share")}
+	v.mu.Unlock()
+
+	if err := New(v, src, opts).Tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(v.submitted); got != 2 {
+		t.Fatalf("episode B: got %d total submissions, want 2 (peer + this node)", got)
+	}
+}
+
 // Negative: an unsealed Vault must never receive shares.
 func TestDoesNothingWhenUnsealed(t *testing.T) {
 	src, path := setup(t, "apps2", 1, "share-one")
@@ -292,6 +333,34 @@ func TestValidateShareLayout(t *testing.T) {
 		if errors.Is(err, ErrTerminal) != tc.terminal {
 			t.Fatalf("local=%d threshold=%d error=%v", tc.local, tc.threshold, err)
 		}
+	}
+}
+
+// Regression: a Vault the daemon cannot reach must still raise the alarm,
+// not just log quietly. Otherwise an unreachable Vault (as opposed to a
+// confirmed-sealed one) can go unnoticed indefinitely.
+func TestAlarmFiresOnUnreachable(t *testing.T) {
+	src, path := setup(t, "apps2", 1, "share-one")
+	v := &fakeVault{statusErr: errors.New("connection refused")}
+
+	var fired int
+	var gotErr error
+	w := New(v, src, Options{
+		NodeID: "apps2", Shares: []Share{{Index: 1, Path: path}},
+		Logger: quietLogger(),
+		OnUnreachable: func(pollErr error) {
+			fired++
+			gotErr = pollErr
+		},
+	})
+	if err := w.Tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if fired != 1 {
+		t.Fatalf("unreachable alarm fired %d times, want 1", fired)
+	}
+	if gotErr == nil || gotErr.Error() != "connection refused" {
+		t.Fatalf("unreachable alarm did not carry the poll error: %v", gotErr)
 	}
 }
 

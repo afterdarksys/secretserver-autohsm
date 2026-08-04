@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/afterdarksys/secretserver-autohsm/internal/watch"
@@ -26,6 +29,40 @@ func TestExitCode(t *testing.T) {
 				t.Fatalf("exitCode()=%d, want %d", got, tt.want)
 			}
 		})
+	}
+}
+
+// Negative: pin_env must be refused for the watch daemon. Unlike pin_file,
+// an env-sourced PIN stays visible via /proc/<pid>/environ for the entire
+// lifetime of a long-running process.
+func TestBuildRejectsPinEnvForWatchDaemon(t *testing.T) {
+	const yaml = `
+node_id: apps2
+vault:
+  address: https://vault.example.com:8200
+  ca_cert_path: /etc/autohsm/vault-ca.pem
+keys:
+  source: pkcs11
+  pkcs11:
+    module_path: /usr/lib/softhsm/libsofthsm2.so
+    key_label: autohsm-wrap
+    pin_env: AUTOHSM_PIN
+  shares:
+    - index: 1
+      path: /etc/autohsm/share-1.wrapped
+`
+	p := filepath.Join(t.TempDir(), "autohsm.yaml")
+	if err := os.WriteFile(p, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, _, err := build(p, true); err == nil || !strings.Contains(err.Error(), "pin_env") {
+		t.Fatalf("watch daemon accepted pin_env: %v", err)
+	}
+
+	// The same config must still be usable for a short-lived subcommand.
+	if _, _, _, err := build(p, false); err == nil || strings.Contains(err.Error(), "pin_env") {
+		t.Fatalf("non-daemon build wrongly rejected on pin_env grounds: %v", err)
 	}
 }
 

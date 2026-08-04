@@ -78,3 +78,35 @@ func TestSealedDetectedPayload(t *testing.T) {
 		t.Fatalf("payload appears to contain key material: %s", raw)
 	}
 }
+
+// Regression: a Vault the daemon cannot even reach must still raise the
+// alarm. Silently retrying forever without ever notifying anyone repeats the
+// "sealed Vault goes unnoticed" failure this package exists to prevent, one
+// layer earlier (at the poll itself rather than at a confirmed sealed state).
+func TestVaultUnreachablePayload(t *testing.T) {
+	var got Payload
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Errorf("decode payload: %v", err)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	n := &Notifier{url: srv.URL, client: srv.Client(), log: discardLogger()}
+	n.VaultUnreachable(context.Background(), "node-1", errors.New("dial tcp: connection refused"))
+	if got.Event != "vault_unreachable" || got.NodeID != "node-1" || got.Timestamp == "" {
+		t.Fatalf("unexpected payload: %+v", got)
+	}
+	if !strings.Contains(got.Error, "connection refused") {
+		t.Fatalf("payload did not carry the poll error: %+v", got)
+	}
+}
+
+func TestEmptyWebhookVaultUnreachableIsNoOp(t *testing.T) {
+	n, err := New("", discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	n.VaultUnreachable(context.Background(), "node-1", errors.New("unreachable"))
+}

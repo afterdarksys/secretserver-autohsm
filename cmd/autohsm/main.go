@@ -126,11 +126,20 @@ type sealedError struct{ msg string }
 
 func (e sealedError) Error() string { return e.msg }
 
-// build wires config into a Vault client and a key source.
-func build(cfgPath string) (*config.Config, *vaultclient.Client, keysource.Source, error) {
+// build wires config into a Vault client and a key source. daemon must be
+// true only for the long-running "watch" subcommand: it refuses a
+// pin_env-sourced PIN there, because that value sits exposed in
+// /proc/<pid>/environ for as long as the process runs, unlike pin_file
+// which is read once and can be tightly permissioned or removed. Short-lived
+// subcommands (status, wrap, selftest) do not carry that exposure window.
+func build(cfgPath string, daemon bool) (*config.Config, *vaultclient.Client, keysource.Source, error) {
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
 		return nil, nil, nil, err
+	}
+	if daemon && cfg.Keys.Source == "pkcs11" && cfg.Keys.PKCS11.PINEnv != "" {
+		return nil, nil, nil, fmt.Errorf(
+			"keys.pkcs11.pin_env is not allowed for the watch daemon (it stays exposed in /proc/<pid>/environ for the process's entire lifetime); use keys.pkcs11.pin_file instead")
 	}
 	vc, err := vaultclient.New(vaultclient.Config{
 		Address:    cfg.Vault.Address,
@@ -217,7 +226,7 @@ func hexDecode(s string) ([]byte, error) {
 }
 
 func runWatch(cfgPath string, log *slog.Logger) error {
-	cfg, vc, src, err := build(cfgPath)
+	cfg, vc, src, err := build(cfgPath, true)
 	if err != nil {
 		return err
 	}
@@ -246,6 +255,9 @@ func runWatch(cfgPath string, log *slog.Logger) error {
 		OnSealed: func(st *vaultclient.SealStatus) {
 			notifier.SealedDetected(ctx, cfg.NodeID, st.Sealed, st.Threshold, st.Shares, st.Progress)
 		},
+		OnUnreachable: func(pollErr error) {
+			notifier.VaultUnreachable(ctx, cfg.NodeID, pollErr)
+		},
 	})
 
 	log.Info("autohsm watching",
@@ -263,7 +275,7 @@ func runWatch(cfgPath string, log *slog.Logger) error {
 }
 
 func runStatus(cfgPath string) error {
-	_, vc, src, err := build(cfgPath)
+	_, vc, src, err := build(cfgPath, false)
 	if err != nil {
 		return err
 	}
@@ -298,7 +310,7 @@ func runWrap(cfgPath string, args []string) error {
 		return fmt.Errorf("--index N (>=1) is required: it is bound into the wrapped share")
 	}
 
-	cfg, _, src, err := build(cfgPath)
+	cfg, _, src, err := build(cfgPath, false)
 	if err != nil {
 		return err
 	}
@@ -360,7 +372,7 @@ func readShare(r io.Reader) ([]byte, error) {
 }
 
 func runSelftest(cfgPath string, log *slog.Logger) error {
-	cfg, vc, src, err := build(cfgPath)
+	cfg, vc, src, err := build(cfgPath, false)
 	if err != nil {
 		return fmt.Errorf("config/TLS/HSM setup: %w", err)
 	}
@@ -379,7 +391,12 @@ func runSelftest(cfgPath string, log *slog.Logger) error {
 
 	// Prove every configured share unwraps for THIS node before we ever need it.
 	for _, s := range cfg.Keys.Shares {
-		blob, rerr := os.ReadFile(s.Path)
+		sf, rerr := config.OpenSecretFile(s.Path, fmt.Sprintf("share %d", s.Index))
+		if rerr != nil {
+			return fmt.Errorf("share %d: %w", s.Index, rerr)
+		}
+		blob, rerr := config.ReadBounded(sf, maxShareSize)
+		sf.Close()
 		if rerr != nil {
 			return fmt.Errorf("share %d: %w", s.Index, rerr)
 		}

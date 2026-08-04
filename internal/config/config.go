@@ -108,13 +108,13 @@ type AlarmConfig struct {
 
 // Load reads, permission-checks, and validates a config file.
 func Load(path string) (*Config, error) {
-	f, err := openSecretFile(path, "config")
+	f, err := OpenSecretFile(path, "config")
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
 
-	raw, err := readBounded(f, maxConfigSize)
+	raw, err := ReadBounded(f, maxConfigSize)
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
@@ -141,7 +141,15 @@ func Load(path string) (*Config, error) {
 	return &cfg, nil
 }
 
-func openSecretFile(path, purpose string) (*os.File, error) {
+// OpenSecretFile opens path and enforces the trust boundary all autohsm
+// secret material (config, PIN, wrapped shares) must meet: a regular file
+// that is either owner-only (0600, owned by the user running this process)
+// or root-owned and group-readable (0640). Callers outside this package
+// (e.g. internal/watch, cmd/autohsm) must use this instead of os.ReadFile
+// for any file whose content is or gates key material — the enforcement
+// happens on the file the OS already has open, so it cannot be bypassed by
+// a TOCTOU swap between check and read.
+func OpenSecretFile(path, purpose string) (*os.File, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("open %s: %w", purpose, err)
@@ -170,6 +178,9 @@ func validateSecretFileMetadata(mode os.FileMode, ownerUID uint32) error {
 	perm := mode.Perm()
 	switch perm {
 	case ownerOnlyMode:
+		if ownerUID != uint32(os.Getuid()) {
+			return fmt.Errorf("mode 0600 is allowed only when owned by the running user (uid %d), got uid %d", os.Getuid(), ownerUID)
+		}
 		return nil
 	case serviceReadMode:
 		if ownerUID != 0 {
@@ -181,7 +192,9 @@ func validateSecretFileMetadata(mode os.FileMode, ownerUID uint32) error {
 	}
 }
 
-func readBounded(r io.Reader, limit int64) ([]byte, error) {
+// ReadBounded reads at most limit bytes from r, refusing (and wiping the
+// partial read) if the source has more.
+func ReadBounded(r io.Reader, limit int64) ([]byte, error) {
 	b, err := io.ReadAll(io.LimitReader(r, limit+1))
 	if err != nil {
 		return nil, err
@@ -311,14 +324,20 @@ func (p PKCS11Config) ResolvePIN() ([]byte, error) {
 		if v == "" {
 			return nil, fmt.Errorf("environment variable %s is empty", p.PINEnv)
 		}
+		// Best-effort only: this cannot scrub the PIN from /proc/<pid>/environ,
+		// which reflects the process's original exec-time environment block for
+		// its entire lifetime regardless of Unsetenv. It does stop the value
+		// from being re-read via os.Environ() or inherited by a future child
+		// process for the remainder of this run.
+		os.Unsetenv(p.PINEnv)
 		return []byte(v), nil
 	case p.PINFile != "":
-		f, err := openSecretFile(p.PINFile, "pin_file")
+		f, err := OpenSecretFile(p.PINFile, "pin_file")
 		if err != nil {
 			return nil, err
 		}
 		defer f.Close()
-		b, err := readBounded(f, maxPINSize)
+		b, err := ReadBounded(f, maxPINSize)
 		if err != nil {
 			return nil, fmt.Errorf("read pin_file: %w", err)
 		}

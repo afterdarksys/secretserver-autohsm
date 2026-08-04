@@ -27,11 +27,18 @@ import (
 	"strings"
 	"time"
 
+	"github.com/afterdarksys/secretserver-autohsm/internal/config"
 	"github.com/afterdarksys/secretserver-autohsm/internal/fingerprint"
 	"github.com/afterdarksys/secretserver-autohsm/internal/keysource"
 	"github.com/afterdarksys/secretserver-autohsm/internal/secure"
 	"github.com/afterdarksys/secretserver-autohsm/internal/vaultclient"
 )
+
+// maxShareFileSize bounds a wrapped-share file read. Envelopes are small
+// (nonce + ciphertext + tag, base64-ish encoded); this matches the plaintext
+// share size bound cmd/autohsm enforces on wrap input, with headroom for the
+// envelope encoding overhead.
+const maxShareFileSize = 8192
 
 // ErrTerminal marks a condition that requires operator intervention. The CLI
 // maps it to a dedicated exit status so the service manager does not erase the
@@ -66,6 +73,10 @@ type Options struct {
 	Logger    *slog.Logger
 	// OnSealed is invoked whenever a sealed Vault is observed (alarm hook).
 	OnSealed func(status *vaultclient.SealStatus)
+	// OnUnreachable is invoked whenever a seal-status poll itself fails (alarm
+	// hook). A Vault we cannot even reach is not a reason to stay quiet: it is
+	// exactly the silent-failure condition this package exists to surface.
+	OnUnreachable func(pollErr error)
 }
 
 // Sealer is the subset of the Vault client the watcher needs.
@@ -86,8 +97,11 @@ type Watcher struct {
 	// submitted tracks shares accepted during the current sealed episode. Vault's
 	// unseal operation is stateful, so resubmitting them on every poll can poison
 	// a distributed unseal with duplicate shares.
-	submitted   map[int]bool
-	stateLoaded bool
+	submitted map[int]bool
+	// submittedNonce is Vault's unseal nonce at the time submitted was last
+	// updated. It identifies which sealed episode the latch belongs to.
+	submittedNonce string
+	stateLoaded    bool
 }
 
 // New builds a watcher.
@@ -135,10 +149,22 @@ func (w *Watcher) Tick(ctx context.Context) error {
 		// A transient reachability problem is not a reason to give up; it is a
 		// reason to be noisy. The failure budget only counts unseal rejections.
 		w.log.Warn("vault seal-status check failed", "error", err)
+		if w.opts.OnUnreachable != nil {
+			w.opts.OnUnreachable(err)
+		}
 		return nil
 	}
 	if err := w.loadSubmittedState(); err != nil {
 		return fmt.Errorf("%w: load submission state: %v", ErrTerminal, err)
+	}
+
+	// Vault's nonce is untrusted input written verbatim into a line-oriented
+	// state file; a value containing a newline could inject a bogus line on
+	// persist. Treat anything but a plain single-line token as "no nonce" and
+	// fall back to the Progress==0 heuristic rather than trust it.
+	if strings.ContainsAny(st.Nonce, "\n\r") {
+		w.log.Warn("vault returned a malformed unseal nonce; ignoring it")
+		st.Nonce = ""
 	}
 
 	if !st.Sealed {
@@ -147,15 +173,28 @@ func (w *Watcher) Tick(ctx context.Context) error {
 		}
 		w.consecutiveFailures = 0
 		clear(w.submitted)
+		w.submittedNonce = ""
 		if err := w.removeSubmittedState(); err != nil {
 			w.log.Warn("could not clear submission state", "error", err)
 		}
 		return nil
 	}
-	if st.Progress == 0 && len(w.submitted) > 0 {
-		// Vault has explicitly reported that it holds no shares. Any local latch
-		// belongs to an older sealed episode and is safe to discard.
+
+	// A sealed episode's identity is Vault's unseal nonce, minted fresh each
+	// time Vault transitions to sealed. A latch recorded under a different
+	// nonce is stale regardless of Progress: relying on Progress==0 alone
+	// misses the case where a restart spans an unseal->reseal we never
+	// directly observed and a peer has already contributed to the new
+	// episode before our next poll, which would otherwise leave this node
+	// believing it has nothing left to submit for an episode it never
+	// actually acted in. Progress==0 remains the fallback for a Vault that
+	// does not report a nonce.
+	stale := len(w.submitted) > 0 &&
+		((st.Nonce != "" && w.submittedNonce != "" && st.Nonce != w.submittedNonce) ||
+			(st.Nonce == "" && st.Progress == 0))
+	if stale {
 		clear(w.submitted)
+		w.submittedNonce = ""
 		if err := w.removeSubmittedState(); err != nil {
 			return fmt.Errorf("%w: clear stale submission state: %v", ErrTerminal, err)
 		}
@@ -178,7 +217,7 @@ func (w *Watcher) Tick(ctx context.Context) error {
 		return err
 	}
 
-	if err := w.submitShares(ctx); err != nil {
+	if err := w.submitShares(ctx, st.Nonce); err != nil {
 		w.consecutiveFailures++
 		w.log.Error("unseal attempt failed",
 			"error", err,
@@ -198,12 +237,17 @@ func (w *Watcher) Tick(ctx context.Context) error {
 
 // submitShares unwraps and submits each share this node holds, wiping plaintext
 // as soon as Vault has consumed it.
-func (w *Watcher) submitShares(ctx context.Context) error {
+func (w *Watcher) submitShares(ctx context.Context, nonce string) error {
 	for _, sh := range w.opts.Shares {
 		if w.submitted[sh.Index] {
 			continue
 		}
-		blob, err := os.ReadFile(sh.Path)
+		f, err := config.OpenSecretFile(sh.Path, fmt.Sprintf("share %d", sh.Index))
+		if err != nil {
+			return fmt.Errorf("read wrapped share %d: %w", sh.Index, err)
+		}
+		blob, err := config.ReadBounded(f, maxShareFileSize)
+		f.Close()
 		if err != nil {
 			return fmt.Errorf("read wrapped share %d: %w", sh.Index, err)
 		}
@@ -221,6 +265,7 @@ func (w *Watcher) submitShares(ctx context.Context) error {
 			return fmt.Errorf("submit share %d: %w", sh.Index, err)
 		}
 		w.submitted[sh.Index] = true
+		w.submittedNonce = nonce
 		if err := w.persistSubmittedState(); err != nil {
 			return fmt.Errorf("%w: persist accepted share %d: %v", ErrTerminal, sh.Index, err)
 		}
@@ -262,6 +307,10 @@ func (w *Watcher) loadSubmittedState() error {
 		if line == "" {
 			continue
 		}
+		if rest, ok := strings.CutPrefix(line, "nonce:"); ok {
+			w.submittedNonce = rest
+			continue
+		}
 		idx, err := strconv.Atoi(line)
 		if err != nil || idx < 1 {
 			return fmt.Errorf("invalid share index %q", line)
@@ -285,6 +334,12 @@ func (w *Watcher) persistSubmittedState() error {
 	if err := tmp.Chmod(0o600); err != nil {
 		tmp.Close()
 		return err
+	}
+	if w.submittedNonce != "" {
+		if _, err := fmt.Fprintf(tmp, "nonce:%s\n", w.submittedNonce); err != nil {
+			tmp.Close()
+			return err
+		}
 	}
 	indexes := make([]int, 0, len(w.submitted))
 	for idx := range w.submitted {

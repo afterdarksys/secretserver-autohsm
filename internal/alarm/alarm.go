@@ -39,6 +39,10 @@ type Payload struct {
 	Threshold int    `json:"threshold"`
 	Shares    int    `json:"shares"`
 	Progress  int    `json:"progress"`
+	// Error is set only for a vault_unreachable event. It carries an error
+	// chain built entirely from fmt.Errorf wrapping in this codebase, never
+	// key material.
+	Error     string `json:"error,omitempty"`
 	Timestamp string `json:"timestamp"`
 }
 
@@ -67,18 +71,35 @@ func New(rawURL string, log *slog.Logger) (*Notifier, error) {
 // SealedDetected fires the alarm. Failures are logged, never fatal: an
 // unreachable webhook must not stop the daemon from unsealing.
 func (n *Notifier) SealedDetected(ctx context.Context, nodeID string, sealed bool, threshold, shares, progress int) {
-	if n.url == "" {
-		return
-	}
-	body, err := json.Marshal(Payload{
+	n.post(ctx, Payload{
 		Event:     "vault_sealed",
 		NodeID:    nodeID,
 		Sealed:    sealed,
 		Threshold: threshold,
 		Shares:    shares,
 		Progress:  progress,
-		Timestamp: time.Now().UTC().Format(time.RFC3339),
 	})
+}
+
+// VaultUnreachable fires the alarm when a seal-status poll itself fails. A
+// Vault the daemon cannot reach is exactly as dangerous as one observed
+// sealed -- silently retrying forever without ever alerting anyone would
+// repeat the "sealed Vault goes unnoticed" failure this package exists to
+// prevent, just one layer earlier.
+func (n *Notifier) VaultUnreachable(ctx context.Context, nodeID string, pollErr error) {
+	n.post(ctx, Payload{
+		Event:  "vault_unreachable",
+		NodeID: nodeID,
+		Error:  pollErr.Error(),
+	})
+}
+
+func (n *Notifier) post(ctx context.Context, p Payload) {
+	if n.url == "" {
+		return
+	}
+	p.Timestamp = time.Now().UTC().Format(time.RFC3339)
+	body, err := json.Marshal(p)
 	if err != nil {
 		return
 	}

@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"unsafe"
 
 	"github.com/miekg/pkcs11"
 )
@@ -103,7 +104,15 @@ func OpenPKCS11(opts PKCS11Options) (Source, error) {
 		cleanup()
 		return nil, fmt.Errorf("pkcs11 open session: %w", err)
 	}
-	if err := ctx.Login(session, pkcs11.CKU_USER, string(opts.PIN)); err != nil {
+	// unsafe.String views opts.PIN without copying, so the caller's deferred
+	// wipe of that slice also erases the memory Login reads from. A plain
+	// string(opts.PIN) conversion instead deep-copies into a second,
+	// unwipeable allocation that lingers until the GC reclaims it on its own
+	// schedule -- exactly the kind of copy secure.Wipe's contract warns
+	// against. opts.PIN is guaranteed non-empty by the check above, so
+	// SliceData is never nil here.
+	pin := unsafe.String(unsafe.SliceData(opts.PIN), len(opts.PIN))
+	if err := ctx.Login(session, pkcs11.CKU_USER, pin); err != nil {
 		_ = ctx.CloseSession(session)
 		cleanup()
 		// The PIN itself is never included in the error.

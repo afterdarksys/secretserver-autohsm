@@ -65,7 +65,12 @@ type SealStatus struct {
 	Threshold   int    `json:"t"`
 	Shares      int    `json:"n"`
 	Progress    int    `json:"progress"`
-	Version     string `json:"version"`
+	// Nonce identifies the current unseal attempt. Vault mints a fresh one each
+	// time it transitions to sealed, so it uniquely identifies a sealed episode
+	// even across a Progress value that a restarting watcher can't otherwise
+	// distinguish from a prior episode's.
+	Nonce   string `json:"nonce"`
+	Version string `json:"version"`
 }
 
 // New builds a client, failing closed on any ambiguity in the TLS configuration.
