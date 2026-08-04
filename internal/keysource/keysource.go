@@ -1,9 +1,9 @@
 // Asset: keysource
 // Purpose: Interface and wrapped-blob format for retrieving unseal key shares.
 // Threats: Defines an AEAD envelope that binds every wrapped share to a specific
-// node and share index, so a share stolen from one host cannot be replayed on
-// another, nor submitted under a different index, even by an attacker who also
-// reaches the HSM. Does NOT protect a share once unwrapped in memory (see secure.Wipe)
+// configured node context and share index, preventing accidental relabeling and
+// index substitution. The node label is not hardware identity. Does NOT protect
+// a share once unwrapped in memory (see secure.Wipe)
 // and does NOT prevent an attacker with live HSM access from unwrapping legitimately.
 // Deps: none (stdlib only)
 // Example: src, _ := keysource.OpenPKCS11(cfg); share, _ := src.Unwrap(ctx, blob, aad)
@@ -24,6 +24,11 @@ import (
 // ambiguity. A blob with an unknown version is rejected, never guessed at.
 const envelopeVersion = "autohsm-v1"
 
+const (
+	gcmNonceLen = 12
+	gcmTagLen   = 16
+)
+
 // Source unwraps a stored share into plaintext key material.
 //
 // Implementations must never log, cache, or copy the plaintext beyond what the
@@ -37,8 +42,8 @@ type Source interface {
 }
 
 // AAD builds the additional authenticated data binding a share to one node and
-// index. Changing node or index changes the AAD, so the AEAD tag check fails
-// and the share cannot be reused elsewhere.
+// index. Changing node or index changes the AAD, so the AEAD tag check fails.
+// NodeID is a configuration label, not proof that code runs on a physical host.
 func AAD(nodeID string, shareIndex int) []byte {
 	return []byte(envelopeVersion + "|node=" + nodeID + "|idx=" + strconv.Itoa(shareIndex))
 }
@@ -78,8 +83,11 @@ func ParseEnvelope(raw []byte) (Envelope, error) {
 	if err != nil {
 		return Envelope{}, fmt.Errorf("decode ciphertext: %w", err)
 	}
-	if len(nonce) == 0 || len(ct) == 0 {
-		return Envelope{}, fmt.Errorf("envelope has an empty nonce or ciphertext")
+	if len(nonce) != gcmNonceLen {
+		return Envelope{}, fmt.Errorf("envelope nonce is %d bytes, require %d", len(nonce), gcmNonceLen)
+	}
+	if len(ct) <= gcmTagLen {
+		return Envelope{}, fmt.Errorf("envelope ciphertext is too short")
 	}
 	return Envelope{Nonce: nonce, Ciphertext: ct}, nil
 }

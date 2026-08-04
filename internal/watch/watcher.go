@@ -14,10 +14,17 @@
 package watch
 
 import (
+	"bufio"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/afterdarksys/secretserver-autohsm/internal/fingerprint"
@@ -25,6 +32,21 @@ import (
 	"github.com/afterdarksys/secretserver-autohsm/internal/secure"
 	"github.com/afterdarksys/secretserver-autohsm/internal/vaultclient"
 )
+
+// ErrTerminal marks a condition that requires operator intervention. The CLI
+// maps it to a dedicated exit status so the service manager does not erase the
+// failure latch by immediately restarting the process.
+var ErrTerminal = errors.New("terminal autohsm failure")
+
+// ValidateShareLayout enforces the distribution property that gives this
+// design its security value: one node must never hold enough shares to unseal.
+func ValidateShareLayout(localShares, threshold int) error {
+	if threshold > 0 && localShares >= threshold {
+		return fmt.Errorf("%w: this node holds %d shares, meeting Vault's threshold of %d; refusing an unsafe single-node unseal layout",
+			ErrTerminal, localShares, threshold)
+	}
+	return nil
+}
 
 // Share is one wrapped share this node holds.
 type Share struct {
@@ -38,7 +60,10 @@ type Options struct {
 	Shares            []Share
 	Interval          time.Duration
 	MaxUnsealAttempts int
-	Logger            *slog.Logger
+	// StatePath persists accepted share indexes across daemon crashes within a
+	// host boot. Put it under /run so a machine reboot starts a fresh episode.
+	StatePath string
+	Logger    *slog.Logger
 	// OnSealed is invoked whenever a sealed Vault is observed (alarm hook).
 	OnSealed func(status *vaultclient.SealStatus)
 }
@@ -58,6 +83,11 @@ type Watcher struct {
 
 	// consecutiveFailures latches toward MaxUnsealAttempts; reset on success.
 	consecutiveFailures int
+	// submitted tracks shares accepted during the current sealed episode. Vault's
+	// unseal operation is stateful, so resubmitting them on every poll can poison
+	// a distributed unseal with duplicate shares.
+	submitted   map[int]bool
+	stateLoaded bool
 }
 
 // New builds a watcher.
@@ -72,7 +102,7 @@ func New(v Sealer, src keysource.Source, opts Options) *Watcher {
 	if opts.MaxUnsealAttempts <= 0 {
 		opts.MaxUnsealAttempts = 5
 	}
-	return &Watcher{vault: v, source: src, opts: opts, log: log}
+	return &Watcher{vault: v, source: src, opts: opts, log: log, submitted: make(map[int]bool)}
 }
 
 // Run polls until ctx is cancelled. It returns only on cancellation or when the
@@ -107,13 +137,28 @@ func (w *Watcher) Tick(ctx context.Context) error {
 		w.log.Warn("vault seal-status check failed", "error", err)
 		return nil
 	}
+	if err := w.loadSubmittedState(); err != nil {
+		return fmt.Errorf("%w: load submission state: %v", ErrTerminal, err)
+	}
 
 	if !st.Sealed {
 		if w.consecutiveFailures > 0 {
 			w.log.Info("vault is unsealed again", "previous_failures", w.consecutiveFailures)
 		}
 		w.consecutiveFailures = 0
+		clear(w.submitted)
+		if err := w.removeSubmittedState(); err != nil {
+			w.log.Warn("could not clear submission state", "error", err)
+		}
 		return nil
+	}
+	if st.Progress == 0 && len(w.submitted) > 0 {
+		// Vault has explicitly reported that it holds no shares. Any local latch
+		// belongs to an older sealed episode and is safe to discard.
+		clear(w.submitted)
+		if err := w.removeSubmittedState(); err != nil {
+			return fmt.Errorf("%w: clear stale submission state: %v", ErrTerminal, err)
+		}
 	}
 
 	// Sealed: alarm first, so the operator learns about it even if unsealing fails.
@@ -129,6 +174,9 @@ func (w *Watcher) Tick(ctx context.Context) error {
 		w.log.Error("vault reports uninitialized; refusing to submit shares (stale key material?)")
 		return nil
 	}
+	if err := ValidateShareLayout(len(w.opts.Shares), st.Threshold); err != nil {
+		return err
+	}
 
 	if err := w.submitShares(ctx); err != nil {
 		w.consecutiveFailures++
@@ -138,8 +186,8 @@ func (w *Watcher) Tick(ctx context.Context) error {
 			"max", w.opts.MaxUnsealAttempts)
 		if w.consecutiveFailures >= w.opts.MaxUnsealAttempts {
 			return fmt.Errorf(
-				"giving up after %d consecutive unseal failures: shares are likely wrong for this Vault (re-initialised?)",
-				w.consecutiveFailures)
+				"%w: giving up after %d consecutive unseal failures: shares are likely wrong for this Vault (re-initialised?)",
+				ErrTerminal, w.consecutiveFailures)
 		}
 		return nil
 	}
@@ -152,6 +200,9 @@ func (w *Watcher) Tick(ctx context.Context) error {
 // as soon as Vault has consumed it.
 func (w *Watcher) submitShares(ctx context.Context) error {
 	for _, sh := range w.opts.Shares {
+		if w.submitted[sh.Index] {
+			continue
+		}
 		blob, err := os.ReadFile(sh.Path)
 		if err != nil {
 			return fmt.Errorf("read wrapped share %d: %w", sh.Index, err)
@@ -169,6 +220,10 @@ func (w *Watcher) submitShares(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("submit share %d: %w", sh.Index, err)
 		}
+		w.submitted[sh.Index] = true
+		if err := w.persistSubmittedState(); err != nil {
+			return fmt.Errorf("%w: persist accepted share %d: %v", ErrTerminal, sh.Index, err)
+		}
 
 		w.log.Info("submitted unseal share",
 			"index", sh.Index,
@@ -185,4 +240,80 @@ func (w *Watcher) submitShares(ctx context.Context) error {
 	// Not an error: this node legitimately may hold fewer than the threshold,
 	// with peers supplying the rest. Staying below threshold is the design.
 	return nil
+}
+
+func (w *Watcher) loadSubmittedState() error {
+	if w.stateLoaded || w.opts.StatePath == "" {
+		w.stateLoaded = true
+		return nil
+	}
+	w.stateLoaded = true
+	f, err := os.Open(w.opts.StatePath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(io.LimitReader(f, 4096))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		idx, err := strconv.Atoi(line)
+		if err != nil || idx < 1 {
+			return fmt.Errorf("invalid share index %q", line)
+		}
+		w.submitted[idx] = true
+	}
+	return scanner.Err()
+}
+
+func (w *Watcher) persistSubmittedState() error {
+	if w.opts.StatePath == "" {
+		return nil
+	}
+	dir := filepath.Dir(w.opts.StatePath)
+	tmp, err := os.CreateTemp(dir, ".submitted-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return err
+	}
+	indexes := make([]int, 0, len(w.submitted))
+	for idx := range w.submitted {
+		indexes = append(indexes, idx)
+	}
+	sort.Ints(indexes)
+	for _, idx := range indexes {
+		if _, err := fmt.Fprintf(tmp, "%d\n", idx); err != nil {
+			tmp.Close()
+			return err
+		}
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, w.opts.StatePath)
+}
+
+func (w *Watcher) removeSubmittedState() error {
+	if w.opts.StatePath == "" {
+		return nil
+	}
+	err := os.Remove(w.opts.StatePath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
 }

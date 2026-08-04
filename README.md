@@ -1,7 +1,7 @@
 # secretserver-autohsm
 
-Keeps a HashiCorp Vault **unsealed across restarts** using unseal key shares that are
-wrapped by an HSM and cryptographically bound to a single node.
+Keeps a HashiCorp Vault **unsealed across restarts** using unseal key shares wrapped
+by a unique, non-replicated HSM key on each node.
 
 Built because Vault's native PKCS#11 auto-unseal is **Enterprise-only**, and a
 community-edition Vault that reboots stays sealed until a human types three keys.
@@ -38,19 +38,25 @@ Consequences, all covered by tests:
 
 | Property | Result |
 |---|---|
-| Wrapped share copied to another host | **fails** — AAD node mismatch |
+| Share used with a different configured node label | **fails** — AAD mismatch |
 | Share replayed under a different index | **fails** — AAD index mismatch |
 | Ciphertext tampered with | **fails** — GCM tag |
 | Disk, backup, or snapshot stolen | **inert** — key never leaves the HSM |
 | Wrong CA presented by "Vault" | **fails** — pinned CA, no system-root fallback |
 | Plaintext `http://` Vault address | **refused at config load** |
 
+`node_id` is an operator-controlled context label, not hardware attestation. It
+prevents accidental cross-node use; it does not prove which physical machine is
+calling the HSM. Actual node separation comes from provisioning a unique,
+non-replicated HSM key per node. A host with access to the same HSM key and the
+original `node_id` can unwrap the envelope.
+
 ### What this does *not* protect against
 
 Auto-unseal has an irreducible tension: something must unseal without a human. The
 daemon authenticates to the HSM unattended, so the **PIN must be available at boot**
-(env var or 0600 file). An attacker with code execution on this host can ask the HSM
-to unwrap exactly as the daemon does.
+(environment variable or protected file). An attacker with code execution on this
+host can ask the HSM to unwrap exactly as the daemon does.
 
 The HSM upgrades your threat model from *"keys are readable on disk"* to *"keys are
 unusable without the token"*. That is genuine defence in depth against disk and backup
@@ -78,14 +84,13 @@ trade: availability against blast radius. Choose deliberately.
 make build
 sudo install -m 0755 bin/autohsm /usr/local/bin/autohsm
 sudo useradd --system --no-create-home --shell /usr/sbin/nologin autohsm
-sudo mkdir -p /etc/autohsm && sudo chmod 0750 /etc/autohsm
+sudo install -d -o root -g autohsm -m 0750 /etc/autohsm
 
-sudo cp examples/autohsm.yaml /etc/autohsm/autohsm.yaml
-sudo chmod 0600 /etc/autohsm/autohsm.yaml     # refuses to start otherwise
-sudo cp /path/to/vault-ca.pem /etc/autohsm/vault-ca.pem
+sudo install -o root -g autohsm -m 0640 examples/autohsm.yaml /etc/autohsm/autohsm.yaml
+sudo install -o root -g autohsm -m 0640 /path/to/vault-ca.pem /etc/autohsm/vault-ca.pem
+sudo install -o root -g autohsm -m 0640 /secure/path/hsm-pin /etc/autohsm/pin
 
 sudo cp deploy/autohsm.service /etc/systemd/system/
-sudo systemctl daemon-reload && sudo systemctl enable --now autohsm
 ```
 
 ### Provision the HSM key and shares
@@ -94,26 +99,48 @@ Create one non-extractable AES-256 key on the token (SoftHSM shown):
 
 ```bash
 softhsm2-util --init-token --slot 0 --label autohsm --so-pin <SO_PIN> --pin <PIN>
-pkcs11-tool --module /usr/lib/softhsm/libsofthsm2.so --login --pin <PIN> \
-  --keygen --key-type aes:32 --label autohsm-wrap --private --sensitive
+AUTOHSM_PIN=<PIN> pkcs11-tool --module /usr/lib/softhsm/libsofthsm2.so \
+  --login --pin env:AUTOHSM_PIN \
+  --keygen --key-type aes:32 --label autohsm-wrap --private --sensitive \
+  --usage-decrypt
 ```
+
+The daemon verifies at startup that the selected key is AES-256, sensitive,
+always-sensitive, non-extractable, never-extractable, and enabled for AES-GCM
+encryption and decryption. A mislabeled or weak key fails closed.
 
 Then wrap this node's share (plaintext is read from stdin, never echoed, and wiped):
 
 ```bash
-AUTOHSM_PIN=<PIN> autohsm wrap --index 1 < /path/to/share-1.txt \
+sudo -u autohsm autohsm wrap --index 1 < /path/to/share-1.txt \
   | sudo tee /etc/autohsm/share-1.wrapped
+sudo chown root:autohsm /etc/autohsm/share-1.wrapped
+sudo chmod 0640 /etc/autohsm/share-1.wrapped
 ```
 
 Verify before you rely on it:
 
 ```bash
-AUTOHSM_PIN=<PIN> autohsm selftest
+sudo -u autohsm autohsm selftest
 ```
 
 `selftest` checks config, the pinned TLS connection to Vault, HSM login, and that
-**every configured share actually unwraps for this node** — so a wrong node, index,
-or key is caught at provisioning time rather than during an outage.
+**every configured share actually unwraps for this node context**. It also refuses
+a node holding enough shares to meet the threshold by itself. Wrong context, index,
+key, and unsafe distribution errors are caught during provisioning rather than an outage.
+
+Only after `selftest` succeeds, enable the service:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now autohsm
+```
+
+During a partial distributed unseal, each daemon records accepted share indexes in
+`/run/autohsm`. This prevents resubmission after a daemon crash while allowing a host
+reboot or a Vault status reporting zero progress to begin a fresh episode. Terminal
+share rejection exits with status 78, which the supplied systemd unit deliberately
+does not restart.
 
 ## Commands
 
@@ -143,6 +170,17 @@ It offers **no hardware protection** and must be opted into explicitly with
 make test
 ```
 
+With SoftHSM installed, run the real PKCS#11 integration test against an isolated
+temporary token:
+
+```bash
+make test-integration \
+  AUTOHSM_TEST_MODULE=/usr/local/opt/softhsm/lib/softhsm/libsofthsm2.so
+```
+
+Use your platform's actual `libsofthsm2.so` path. The test creates its token under
+the test temporary directory and never touches the system SoftHSM token store.
+
 ## Status
 
 | Component | State |
@@ -151,8 +189,11 @@ make test
 | Config validation and permission gates | tested, incl. negative cases |
 | Vault client, TLS pinning, timeouts, body limits | tested, incl. negative cases |
 | Watcher loop, failure budget, alarm hook | tested |
-| **PKCS#11 source** | **implemented, not yet exercised against a live token** |
+| PKCS#11 attribute/mechanism validation | unit tested |
+| PKCS#11 source against SoftHSM 2.7 | integration tested |
+| **PKCS#11 source against production hardware** | **not yet exercised** |
 
-The PKCS#11 path is written against the v2.40 AES-GCM interface but has not run
-against real hardware or SoftHSM. Run `autohsm selftest` on a host with the module
-present before trusting it. Everything else is covered by the suite.
+The PKCS#11 path is written against the v2.40 AES-GCM interface and is exercised
+against SoftHSM in the opt-in integration test. Run `autohsm selftest` against the
+actual production token before trusting a deployment; hardware and vendor modules
+can differ from SoftHSM.

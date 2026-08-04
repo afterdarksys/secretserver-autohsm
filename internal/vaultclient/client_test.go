@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -143,6 +144,54 @@ func TestSubmitUnsealShareRejectsEmpty(t *testing.T) {
 	}
 	if _, err := c.SubmitUnsealShare(context.Background(), nil); err == nil {
 		t.Fatal("empty share accepted")
+	}
+}
+
+func TestMarshalUnsealRequestRoundTripsWithoutStringConversion(t *testing.T) {
+	share := []byte("quoted-\"-slash-\\-line-\n-unicode-✓")
+	body, err := marshalUnsealRequest(share)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload struct {
+		Key string `json:"key"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if payload.Key != string(share) {
+		t.Fatalf("round trip got %q, want %q", payload.Key, share)
+	}
+}
+
+func TestMarshalUnsealRequestRejectsInvalidUTF8(t *testing.T) {
+	if _, err := marshalUnsealRequest([]byte{0xff, 0xfe}); err == nil {
+		t.Fatal("invalid UTF-8 share accepted")
+	}
+}
+
+func TestSubmitUnsealShareSendsExactValue(t *testing.T) {
+	var got string
+	srv, ca := newTestVault(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload struct {
+			Key string `json:"key"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		got = payload.Key
+		fmt.Fprint(w, `{"initialized":true,"sealed":false,"t":3,"n":5,"progress":0}`)
+	}))
+	c, err := New(Config{Address: srv.URL, CACertPath: ca, MinTLS13: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	share := []byte("share-with-\"-and-\\")
+	if _, err := c.SubmitUnsealShare(context.Background(), share); err != nil {
+		t.Fatal(err)
+	}
+	if got != string(share) {
+		t.Fatalf("server got %q, want %q", got, share)
 	}
 }
 

@@ -31,7 +31,7 @@ func (f *fakeVault) SealStatus(context.Context) (*vaultclient.SealStatus, error)
 	if f.statusErr != nil {
 		return nil, f.statusErr
 	}
-	return &vaultclient.SealStatus{Sealed: f.sealed, Initialized: f.initted, Threshold: 3, Shares: 5}, nil
+	return &vaultclient.SealStatus{Sealed: f.sealed, Initialized: f.initted, Threshold: 3, Shares: 5, Progress: len(f.submitted)}, nil
 }
 
 func (f *fakeVault) SubmitUnsealShare(_ context.Context, share []byte) (*vaultclient.SealStatus, error) {
@@ -94,6 +94,99 @@ func TestUnsealsWhenSealed(t *testing.T) {
 	}
 }
 
+// A partial distributed unseal is stateful. Once this node's share has been
+// accepted, subsequent polls must wait for peers instead of resubmitting it.
+func TestDoesNotResubmitAcceptedShareWhileStillSealed(t *testing.T) {
+	src, path := setup(t, "apps2", 1, "share-one")
+	v := &fakeVault{sealed: true, initted: true}
+	w := New(v, src, Options{
+		NodeID: "apps2", Shares: []Share{{Index: 1, Path: path}}, Logger: quietLogger(),
+	})
+
+	for i := 0; i < 3; i++ {
+		if err := w.Tick(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := len(v.submitted); got != 1 {
+		t.Fatalf("submitted the same share %d times, want once", got)
+	}
+}
+
+func TestSubmissionLatchResetsAfterObservedUnseal(t *testing.T) {
+	src, path := setup(t, "apps2", 1, "share-one")
+	v := &fakeVault{sealed: true, initted: true}
+	w := New(v, src, Options{
+		NodeID: "apps2", Shares: []Share{{Index: 1, Path: path}}, Logger: quietLogger(),
+	})
+
+	if err := w.Tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	v.sealed = false
+	if err := w.Tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	v.sealed = true
+	if err := w.Tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(v.submitted); got != 2 {
+		t.Fatalf("new sealed episode submitted %d total shares, want 2", got)
+	}
+}
+
+func TestSubmissionLatchSurvivesDaemonRestart(t *testing.T) {
+	src, path := setup(t, "apps2", 1, "share-one")
+	v := &fakeVault{sealed: true, initted: true}
+	statePath := filepath.Join(t.TempDir(), "submitted")
+	opts := Options{
+		NodeID: "apps2", Shares: []Share{{Index: 1, Path: path}}, StatePath: statePath, Logger: quietLogger(),
+	}
+	if err := New(v, src, opts).Tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := New(v, src, opts).Tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(v.submitted); got != 1 {
+		t.Fatalf("daemon restart caused %d submissions, want one", got)
+	}
+}
+
+func TestZeroVaultProgressClearsPersistedLatch(t *testing.T) {
+	src, path := setup(t, "apps2", 1, "share-one")
+	statePath := filepath.Join(t.TempDir(), "submitted")
+	if err := os.WriteFile(statePath, []byte("1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	v := &fakeVault{sealed: true, initted: true}
+	w := New(v, src, Options{
+		NodeID: "apps2", Shares: []Share{{Index: 1, Path: path}}, StatePath: statePath, Logger: quietLogger(),
+	})
+	if err := w.Tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(v.submitted); got != 1 {
+		t.Fatalf("fresh Vault received %d shares, want one", got)
+	}
+}
+
+func TestMalformedSubmissionStateIsTerminal(t *testing.T) {
+	src, path := setup(t, "apps2", 1, "share-one")
+	statePath := filepath.Join(t.TempDir(), "submitted")
+	if err := os.WriteFile(statePath, []byte("not-an-index\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	v := &fakeVault{sealed: true, initted: true}
+	w := New(v, src, Options{
+		NodeID: "apps2", Shares: []Share{{Index: 1, Path: path}}, StatePath: statePath, Logger: quietLogger(),
+	})
+	if err := w.Tick(context.Background()); !errors.Is(err, ErrTerminal) {
+		t.Fatalf("malformed state was not terminal: %v", err)
+	}
+}
+
 // Negative: an unsealed Vault must never receive shares.
 func TestDoesNothingWhenUnsealed(t *testing.T) {
 	src, path := setup(t, "apps2", 1, "share-one")
@@ -123,9 +216,9 @@ func TestRefusesUninitializedVault(t *testing.T) {
 	}
 }
 
-// Negative: a share wrapped for a different node must not be submitted. This is
-// the deployment-safety property — copying a share file to another host fails.
-func TestRefusesShareWrappedForAnotherNode(t *testing.T) {
+// Negative: a share wrapped for a different configured node context must not be
+// submitted. This is an AAD integrity property, not physical host identity.
+func TestRefusesShareWrappedForAnotherNodeContext(t *testing.T) {
 	src, path := setup(t, "apps2", 1, "share-one")
 	v := &fakeVault{sealed: true, initted: true}
 
@@ -159,6 +252,46 @@ func TestGivesUpAfterMaxAttempts(t *testing.T) {
 	}
 	if err == nil {
 		t.Fatal("watcher did not give up after the attempt budget was exhausted")
+	}
+	if !errors.Is(err, ErrTerminal) {
+		t.Fatalf("attempt exhaustion is not terminal: %v", err)
+	}
+}
+
+func TestRefusesSingleNodeThresholdLayout(t *testing.T) {
+	src, path := setup(t, "apps2", 1, "share-one")
+	v := &fakeVault{sealed: true, initted: true}
+	w := New(v, src, Options{
+		NodeID: "apps2",
+		Shares: []Share{
+			{Index: 1, Path: path}, {Index: 2, Path: path}, {Index: 3, Path: path},
+		},
+		Logger: quietLogger(),
+	})
+	err := w.Tick(context.Background())
+	if !errors.Is(err, ErrTerminal) {
+		t.Fatalf("unsafe threshold layout was not terminal: %v", err)
+	}
+	if len(v.submitted) != 0 {
+		t.Fatal("submitted a share from an unsafe single-node layout")
+	}
+}
+
+func TestValidateShareLayout(t *testing.T) {
+	for _, tc := range []struct {
+		local, threshold int
+		terminal         bool
+	}{
+		{1, 3, false},
+		{2, 3, false},
+		{3, 3, true},
+		{4, 3, true},
+		{1, 0, false},
+	} {
+		err := ValidateShareLayout(tc.local, tc.threshold)
+		if errors.Is(err, ErrTerminal) != tc.terminal {
+			t.Fatalf("local=%d threshold=%d error=%v", tc.local, tc.threshold, err)
+		}
 	}
 }
 

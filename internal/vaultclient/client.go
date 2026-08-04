@@ -26,6 +26,9 @@ import (
 	"os"
 	"strings"
 	"time"
+	"unicode/utf8"
+
+	"github.com/afterdarksys/secretserver-autohsm/internal/secure"
 )
 
 // maxBody bounds any response we will read. Vault's seal-status and unseal
@@ -145,15 +148,52 @@ func (c *Client) SubmitUnsealShare(ctx context.Context, share []byte) (*SealStat
 	if len(share) == 0 {
 		return nil, fmt.Errorf("refusing to submit an empty unseal share")
 	}
-	body, err := json.Marshal(map[string]string{"key": string(share)})
+	body, err := marshalUnsealRequest(share)
 	if err != nil {
 		return nil, fmt.Errorf("encode unseal request: %w", err)
 	}
+	defer secure.Wipe(body)
 	var st SealStatus
 	if err := c.do(ctx, http.MethodPut, "/v1/sys/unseal", body, &st); err != nil {
 		return nil, err
 	}
 	return &st, nil
+}
+
+// marshalUnsealRequest builds JSON directly in a wipeable byte buffer. Using
+// json.Marshal on a string would leave an immutable plaintext copy of the share
+// in the Go heap.
+func marshalUnsealRequest(share []byte) ([]byte, error) {
+	if !utf8.Valid(share) {
+		return nil, fmt.Errorf("unseal share is not valid UTF-8")
+	}
+	body := make([]byte, 0, len(share)+10)
+	body = append(body, '{', '"', 'k', 'e', 'y', '"', ':', '"')
+	const hex = "0123456789abcdef"
+	for _, b := range share {
+		switch b {
+		case '"', '\\':
+			body = append(body, '\\', b)
+		case '\b':
+			body = append(body, `\b`...)
+		case '\f':
+			body = append(body, `\f`...)
+		case '\n':
+			body = append(body, `\n`...)
+		case '\r':
+			body = append(body, `\r`...)
+		case '\t':
+			body = append(body, `\t`...)
+		default:
+			if b < 0x20 {
+				body = append(body, '\\', 'u', '0', '0', hex[b>>4], hex[b&0x0f])
+			} else {
+				body = append(body, b)
+			}
+		}
+	}
+	body = append(body, '"', '}')
+	return body, nil
 }
 
 func (c *Client) do(ctx context.Context, method, path string, body []byte, out any) error {

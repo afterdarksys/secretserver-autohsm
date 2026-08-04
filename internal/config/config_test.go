@@ -53,9 +53,10 @@ func TestLoadValidConfig(t *testing.T) {
 	}
 }
 
-// Negative: a world- or group-readable config may expose the HSM PIN.
+// Negative: world access or group write access is never allowed. Root-owned
+// group-readable files are separately permitted for the dedicated service.
 func TestLoadRejectsLoosePermissions(t *testing.T) {
-	for _, mode := range []os.FileMode{0o644, 0o640, 0o604, 0o666, 0o777} {
+	for _, mode := range []os.FileMode{0o644, 0o604, 0o660, 0o666, 0o777} {
 		_, err := Load(write(t, validYAML, mode))
 		if err == nil {
 			t.Fatalf("accepted config with mode %04o", mode)
@@ -66,11 +67,51 @@ func TestLoadRejectsLoosePermissions(t *testing.T) {
 	}
 }
 
+func TestSecretFileMetadataAcceptsRootServiceGroupMode(t *testing.T) {
+	if err := validateSecretFileMetadata(0o640, 0); err != nil {
+		t.Fatalf("root-owned 0640 file rejected: %v", err)
+	}
+	if err := validateSecretFileMetadata(0o640, 1000); err == nil {
+		t.Fatal("non-root-owned 0640 file accepted")
+	}
+}
+
+func TestLoadRejectsNonRegularFile(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(dir); err == nil {
+		t.Fatal("directory accepted as configuration")
+	}
+}
+
+func TestLoadRejectsOversizedConfig(t *testing.T) {
+	body := validYAML + "\n# " + strings.Repeat("x", maxConfigSize)
+	if _, err := Load(write(t, body, 0o600)); err == nil {
+		t.Fatal("oversized configuration accepted")
+	}
+}
+
 // Negative: a mistyped security setting must be an error, not a silent default.
 func TestLoadRejectsUnknownFields(t *testing.T) {
 	body := validYAML + "\nunknown_setting: true\n"
 	if _, err := Load(write(t, body, 0o600)); err == nil {
 		t.Fatal("unknown field accepted")
+	}
+}
+
+func TestLoadRejectsMultipleYAMLDocuments(t *testing.T) {
+	body := validYAML + "\n---\nnode_id: hidden-second-document\n"
+	if _, err := Load(write(t, body, 0o600)); err == nil {
+		t.Fatal("multiple YAML documents accepted")
+	}
+}
+
+func TestLoadRejectsUnimplementedMetricsSetting(t *testing.T) {
+	body := validYAML + "\nalarm:\n  metrics_addr: 127.0.0.1:9090\n"
+	if _, err := Load(write(t, body, 0o600)); err == nil {
+		t.Fatal("accepted an unimplemented metrics setting")
 	}
 }
 
@@ -187,5 +228,23 @@ func TestResolvePINRejectsLoosePINFile(t *testing.T) {
 	}
 	if string(pin) != "1234" {
 		t.Fatalf("trailing newline not trimmed: %q", pin)
+	}
+
+}
+
+func TestLoadRejectsInlinePIN(t *testing.T) {
+	body := strings.Replace(validYAML, "    pin_env: AUTOHSM_PIN", "    pin: secret", 1)
+	if _, err := Load(write(t, body, 0o600)); err == nil {
+		t.Fatal("inline HSM PIN accepted")
+	}
+}
+
+func TestResolvePINRejectsEmptyFile(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "pin")
+	if err := os.WriteFile(p, []byte("\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (PKCS11Config{PINFile: p}).ResolvePIN(); err == nil {
+		t.Fatal("empty PIN file accepted")
 	}
 }

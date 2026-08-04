@@ -1,10 +1,8 @@
-# autohsm configuration — install at /etc/autohsm/autohsm.yaml with mode 0600.
-# The daemon refuses to start if the mode is anything else: this file may hold
-# an HSM PIN.
+# Install root:autohsm with mode 0640. The daemon also accepts owner-only 0600.
 
-# Identifies this host. Bound into every wrapped share, so a share wrapped for
-# this node cannot be unwrapped anywhere else. Changing it invalidates the
-# node's shares — re-wrap them if you rename a host.
+# Operator-assigned context label bound into every wrapped share. It prevents
+# accidental cross-node use but is not hardware identity; use a unique HSM key
+# per node for actual separation. Changing it requires re-wrapping the shares.
 node_id: apps2
 
 vault:
@@ -24,10 +22,10 @@ keys:
     module_path: /usr/lib/softhsm/libsofthsm2.so
     token_label: autohsm          # optional; first token used if omitted
     key_label: autohsm-wrap       # non-extractable AES-256 key on the token
-    # Exactly one PIN source. pin_env / pin_file are preferred over inline.
-    pin_env: AUTOHSM_PIN
-    # pin_file: /etc/autohsm/pin  # must be mode 0600
-    # pin: "1234"                 # discouraged
+    # Exactly one external PIN source. The systemd deployment uses a root-owned,
+    # autohsm-readable file; inline PINs are deliberately unsupported.
+    pin_file: /etc/autohsm/pin  # root:autohsm, mode 0640
+    # pin_env: AUTOHSM_PIN      # useful for interactive provisioning only
 
   # Shares THIS node holds. Keep this list shorter than Vault's unseal
   # threshold: if one node can reach threshold alone, compromising that node

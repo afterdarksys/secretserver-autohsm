@@ -2,8 +2,8 @@
 // Purpose: HSM-backed key source — unwraps unseal shares with an AES-256-GCM key that never leaves the token.
 // Threats: Ensures unseal key shares are unrecoverable from stolen disks, backups, or
 // filesystem snapshots: the wrapped blobs are inert without the token, and the wrapping
-// key is non-extractable. Binds each share to node+index via GCM AAD so a blob cannot be
-// replayed on another host. Gives the HSM an audit point and a revocation lever (destroy
+// key is non-extractable. Binds each share to configured node context+index via GCM AAD,
+// preventing accidental relabeling. Gives the HSM an audit point and a revocation lever (destroy
 // the key). Does NOT defend against an attacker executing code on this host while the
 // session is open — they can ask the HSM to unwrap exactly as the daemon does. Auto-unseal
 // inherently trades some of Vault's sealed-at-rest guarantee for availability.
@@ -16,6 +16,7 @@
 package keysource
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"sync"
@@ -85,6 +86,17 @@ func OpenPKCS11(opts PKCS11Options) (Source, error) {
 		cleanup()
 		return nil, err
 	}
+	mechanismInfo, err := ctx.GetMechanismInfo(slot, []*pkcs11.Mechanism{
+		pkcs11.NewMechanism(pkcs11.CKM_AES_GCM, nil),
+	})
+	if err != nil {
+		cleanup()
+		return nil, fmt.Errorf("pkcs11 token does not support CKM_AES_GCM: %w", err)
+	}
+	if err := validateGCMMechanism(mechanismInfo); err != nil {
+		cleanup()
+		return nil, err
+	}
 
 	session, err := ctx.OpenSession(slot, pkcs11.CKF_SERIAL_SESSION)
 	if err != nil {
@@ -105,8 +117,75 @@ func OpenPKCS11(opts PKCS11Options) (Source, error) {
 		cleanup()
 		return nil, err
 	}
+	if err := validateSecretKey(ctx, session, key); err != nil {
+		_ = ctx.Logout(session)
+		_ = ctx.CloseSession(session)
+		cleanup()
+		return nil, fmt.Errorf("pkcs11 key %q is unsafe: %w", opts.KeyLabel, err)
+	}
 
 	return &pkcs11Source{ctx: ctx, session: session, key: key}, nil
+}
+
+func validateGCMMechanism(info pkcs11.MechanismInfo) error {
+	const required = pkcs11.CKF_ENCRYPT | pkcs11.CKF_DECRYPT
+	if info.Flags&required != required {
+		return fmt.Errorf("pkcs11 CKM_AES_GCM mechanism must support both encrypt and decrypt")
+	}
+	if info.MinKeySize > 32 || info.MaxKeySize < 32 {
+		return fmt.Errorf("pkcs11 CKM_AES_GCM mechanism does not support 32-byte AES keys (range %d..%d)",
+			info.MinKeySize, info.MaxKeySize)
+	}
+	return nil
+}
+
+func validateSecretKey(ctx *pkcs11.Ctx, session pkcs11.SessionHandle, key pkcs11.ObjectHandle) error {
+	requested := []*pkcs11.Attribute{
+		pkcs11.NewAttribute(pkcs11.CKA_VALUE_LEN, nil),
+		pkcs11.NewAttribute(pkcs11.CKA_SENSITIVE, nil),
+		pkcs11.NewAttribute(pkcs11.CKA_EXTRACTABLE, nil),
+		pkcs11.NewAttribute(pkcs11.CKA_ALWAYS_SENSITIVE, nil),
+		pkcs11.NewAttribute(pkcs11.CKA_NEVER_EXTRACTABLE, nil),
+		pkcs11.NewAttribute(pkcs11.CKA_ENCRYPT, nil),
+		pkcs11.NewAttribute(pkcs11.CKA_DECRYPT, nil),
+	}
+	attrs, err := ctx.GetAttributeValue(session, key, requested)
+	if err != nil {
+		return fmt.Errorf("read security attributes: %w", err)
+	}
+	return validateSecretKeyAttributes(attrs)
+}
+
+func validateSecretKeyAttributes(attrs []*pkcs11.Attribute) error {
+	byType := make(map[uint][]byte, len(attrs))
+	for _, attr := range attrs {
+		if attr != nil {
+			byType[attr.Type] = attr.Value
+		}
+	}
+	wantLen := pkcs11.NewAttribute(pkcs11.CKA_VALUE_LEN, uint(32)).Value
+	if !bytes.Equal(byType[pkcs11.CKA_VALUE_LEN], wantLen) {
+		return fmt.Errorf("CKA_VALUE_LEN must be 32 bytes (AES-256)")
+	}
+	for _, typ := range []uint{
+		pkcs11.CKA_SENSITIVE,
+		pkcs11.CKA_ALWAYS_SENSITIVE,
+		pkcs11.CKA_NEVER_EXTRACTABLE,
+		pkcs11.CKA_ENCRYPT,
+		pkcs11.CKA_DECRYPT,
+	} {
+		if !attributeBool(byType[typ]) {
+			return fmt.Errorf("attribute 0x%x must be true", typ)
+		}
+	}
+	if value, ok := byType[pkcs11.CKA_EXTRACTABLE]; !ok || len(value) != 1 || value[0] != 0 {
+		return fmt.Errorf("CKA_EXTRACTABLE must be false")
+	}
+	return nil
+}
+
+func attributeBool(value []byte) bool {
+	return len(value) == 1 && value[0] != 0
 }
 
 func selectSlot(ctx *pkcs11.Ctx, slots []uint, tokenLabel string) (uint, error) {
@@ -186,24 +265,28 @@ func (s *pkcs11Source) Unwrap(_ context.Context, blob []byte, aad []byte) ([]byt
 }
 
 // WrapPKCS11 encrypts plaintext inside the token, for provisioning.
-func (s *pkcs11Source) wrap(nonce, plaintext, aad []byte) ([]byte, error) {
+func (s *pkcs11Source) wrap(nonce, plaintext, aad []byte) ([]byte, []byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
-		return nil, fmt.Errorf("pkcs11 source is closed")
+		return nil, nil, fmt.Errorf("pkcs11 source is closed")
 	}
 	params := pkcs11.NewGCMParams(nonce, aad, gcmTagBits)
 	defer params.Free()
 
 	mech := []*pkcs11.Mechanism{pkcs11.NewMechanism(pkcs11.CKM_AES_GCM, params)}
 	if err := s.ctx.EncryptInit(s.session, mech, s.key); err != nil {
-		return nil, fmt.Errorf("pkcs11 encrypt init: %w", err)
+		return nil, nil, fmt.Errorf("pkcs11 encrypt init: %w", err)
 	}
 	ct, err := s.ctx.Encrypt(s.session, plaintext)
 	if err != nil {
-		return nil, fmt.Errorf("pkcs11 encrypt: %w", err)
+		return nil, nil, fmt.Errorf("pkcs11 encrypt: %w", err)
 	}
-	return ct, nil
+	actualNonce := params.IV()
+	if len(actualNonce) != 12 {
+		return nil, nil, fmt.Errorf("pkcs11 token returned a %d-byte GCM nonce, require 12", len(actualNonce))
+	}
+	return ct, actualNonce, nil
 }
 
 // Wrap produces an envelope using the token's key. Exposed via the CLI so that
@@ -216,11 +299,14 @@ func Wrap(src Source, nonce, plaintext, aad []byte) (string, error) {
 	if len(plaintext) == 0 {
 		return "", fmt.Errorf("refusing to wrap an empty share")
 	}
-	ct, err := p.wrap(nonce, plaintext, aad)
+	if len(nonce) != 12 {
+		return "", fmt.Errorf("GCM nonce must be 12 bytes, got %d", len(nonce))
+	}
+	ct, actualNonce, err := p.wrap(nonce, plaintext, aad)
 	if err != nil {
 		return "", err
 	}
-	return MarshalEnvelope(Envelope{Nonce: nonce, Ciphertext: ct}), nil
+	return MarshalEnvelope(Envelope{Nonce: actualNonce, Ciphertext: ct}), nil
 }
 
 func (s *pkcs11Source) Close() error {

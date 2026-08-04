@@ -1,7 +1,7 @@
 // Asset: autohsm-config
 // Purpose: Load and strictly validate autohsm configuration, failing closed on anything ambiguous.
-// Threats: Prevents an unsafe daemon from starting at all — world-readable config holding
-// HSM PINs or wrapped shares, plaintext Vault URLs, missing CA pins, or a dev-only key
+// Threats: Prevents an unsafe daemon from starting at all — loosely protected config,
+// plaintext Vault URLs, missing CA pins, or a dev-only key
 // source enabled by accident in production. Refuses unknown fields so a typo'd security
 // setting is an error rather than a silently ignored default. Does NOT protect the config
 // file's contents at rest (that is the filesystem's and the HSM's job).
@@ -13,29 +13,35 @@
 package config
 
 import (
+	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"strings"
+	"syscall"
 	"time"
 
 	"gopkg.in/yaml.v3"
 )
 
-// requiredMode is the only acceptable permission set for the config file.
-// Anything broader can expose the HSM PIN or wrapped share paths.
-const requiredMode os.FileMode = 0o600
+const (
+	ownerOnlyMode   os.FileMode = 0o600
+	serviceReadMode os.FileMode = 0o640
+	maxConfigSize               = 1 << 20
+	maxPINSize                  = 4096
+)
 
 // Config is the top-level daemon configuration.
 type Config struct {
-	// NodeID identifies this host. It is bound into the AEAD additional data of
-	// every wrapped share, so a share wrapped for one node cannot be unwrapped
-	// on another even with the same HSM key.
+	// NodeID is an operator-assigned context label bound into each envelope's
+	// AAD. It prevents accidental cross-node use but is not hardware identity;
+	// actual host separation requires a unique, non-replicated HSM key per node.
 	NodeID string `yaml:"node_id"`
 
-	Vault  VaultConfig  `yaml:"vault"`
-	Keys   KeysConfig   `yaml:"keys"`
-	Watch  WatchConfig  `yaml:"watch"`
-	Alarm  AlarmConfig  `yaml:"alarm"`
+	Vault VaultConfig `yaml:"vault"`
+	Keys  KeysConfig  `yaml:"keys"`
+	Watch WatchConfig `yaml:"watch"`
+	Alarm AlarmConfig `yaml:"alarm"`
 }
 
 // VaultConfig describes the Vault endpoint to keep unsealed.
@@ -79,10 +85,8 @@ type PKCS11Config struct {
 	TokenLabel string `yaml:"token_label"`
 	KeyLabel   string `yaml:"key_label"`
 
-	// Exactly one PIN source must be set. PINFile and PINEnv are preferred;
-	// PIN inline is supported because the config is already 0600, but it keeps
-	// the secret in one more place than necessary.
-	PIN     string `yaml:"pin"`
+	// Exactly one external PIN source must be set. Inline PINs are deliberately
+	// unsupported so the main configuration never contains the HSM credential.
 	PINFile string `yaml:"pin_file"`
 	PINEnv  string `yaml:"pin_env"`
 }
@@ -100,34 +104,34 @@ type WatchConfig struct {
 type AlarmConfig struct {
 	// WebhookURL, if set, must be https.
 	WebhookURL string `yaml:"webhook_url"`
-	// MetricsAddr, if set, exposes Prometheus-style counters. Bind to
-	// localhost unless you have a reason not to.
-	MetricsAddr string `yaml:"metrics_addr"`
 }
 
 // Load reads, permission-checks, and validates a config file.
 func Load(path string) (*Config, error) {
-	info, err := os.Stat(path)
+	f, err := openSecretFile(path, "config")
 	if err != nil {
-		return nil, fmt.Errorf("stat config: %w", err)
+		return nil, err
 	}
-	// Fail closed on permissions: the file may hold an HSM PIN.
-	if mode := info.Mode().Perm(); mode != requiredMode {
-		return nil, fmt.Errorf(
-			"config %s has mode %04o, refusing to start (require %04o: it may contain an HSM PIN)",
-			path, mode, requiredMode)
-	}
+	defer f.Close()
 
-	raw, err := os.ReadFile(path)
+	raw, err := readBounded(f, maxConfigSize)
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
+	defer wipe(raw)
 
 	var cfg Config
-	dec := yaml.NewDecoder(strings.NewReader(string(raw)))
+	dec := yaml.NewDecoder(bytes.NewReader(raw))
 	dec.KnownFields(true) // a mistyped security setting must be an error
 	if err := dec.Decode(&cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return nil, fmt.Errorf("parse config: multiple YAML documents are not allowed")
+		}
+		return nil, fmt.Errorf("parse trailing config data: %w", err)
 	}
 
 	cfg.applyDefaults()
@@ -135,6 +139,64 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 	return &cfg, nil
+}
+
+func openSecretFile(path, purpose string) (*os.File, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open %s: %w", purpose, err)
+	}
+	info, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, fmt.Errorf("stat %s: %w", purpose, err)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		f.Close()
+		return nil, fmt.Errorf("stat %s: cannot determine file owner", purpose)
+	}
+	if err := validateSecretFileMetadata(info.Mode(), uint32(stat.Uid)); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("%s %s: %w", purpose, path, err)
+	}
+	return f, nil
+}
+
+func validateSecretFileMetadata(mode os.FileMode, ownerUID uint32) error {
+	if !mode.IsRegular() {
+		return fmt.Errorf("not a regular file")
+	}
+	perm := mode.Perm()
+	switch perm {
+	case ownerOnlyMode:
+		return nil
+	case serviceReadMode:
+		if ownerUID != 0 {
+			return fmt.Errorf("mode 0640 is allowed only on a root-owned file")
+		}
+		return nil
+	default:
+		return fmt.Errorf("mode %04o; require owner-only 0600 or root-owned 0640", perm)
+	}
+}
+
+func readBounded(r io.Reader, limit int64) ([]byte, error) {
+	b, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(b)) > limit {
+		wipe(b)
+		return nil, fmt.Errorf("file exceeds %d bytes", limit)
+	}
+	return b, nil
+}
+
+func wipe(b []byte) {
+	for i := range b {
+		b[i] = 0
+	}
 }
 
 func (c *Config) applyDefaults() {
@@ -226,16 +288,16 @@ func (p PKCS11Config) validate() error {
 		return fmt.Errorf("keys.pkcs11.key_label is required")
 	}
 	set := 0
-	for _, v := range []string{p.PIN, p.PINFile, p.PINEnv} {
+	for _, v := range []string{p.PINFile, p.PINEnv} {
 		if v != "" {
 			set++
 		}
 	}
 	if set == 0 {
-		return fmt.Errorf("one of keys.pkcs11.pin, pin_file, or pin_env is required")
+		return fmt.Errorf("one of keys.pkcs11.pin_file or pin_env is required")
 	}
 	if set > 1 {
-		return fmt.Errorf("set exactly one of keys.pkcs11.pin, pin_file, or pin_env (got %d)", set)
+		return fmt.Errorf("set exactly one of keys.pkcs11.pin_file or pin_env (got %d)", set)
 	}
 	return nil
 }
@@ -244,8 +306,6 @@ func (p PKCS11Config) validate() error {
 // The result is key material: wipe it after use and never log it.
 func (p PKCS11Config) ResolvePIN() ([]byte, error) {
 	switch {
-	case p.PIN != "":
-		return []byte(p.PIN), nil
 	case p.PINEnv != "":
 		v := os.Getenv(p.PINEnv)
 		if v == "" {
@@ -253,18 +313,21 @@ func (p PKCS11Config) ResolvePIN() ([]byte, error) {
 		}
 		return []byte(v), nil
 	case p.PINFile != "":
-		info, err := os.Stat(p.PINFile)
+		f, err := openSecretFile(p.PINFile, "pin_file")
 		if err != nil {
-			return nil, fmt.Errorf("stat pin_file: %w", err)
+			return nil, err
 		}
-		if mode := info.Mode().Perm(); mode != requiredMode {
-			return nil, fmt.Errorf("pin_file %s has mode %04o, require %04o", p.PINFile, mode, requiredMode)
-		}
-		b, err := os.ReadFile(p.PINFile)
+		defer f.Close()
+		b, err := readBounded(f, maxPINSize)
 		if err != nil {
 			return nil, fmt.Errorf("read pin_file: %w", err)
 		}
-		return []byte(strings.TrimRight(string(b), "\r\n")), nil
+		pin := bytes.TrimRight(b, "\r\n")
+		if len(pin) == 0 {
+			wipe(b)
+			return nil, fmt.Errorf("pin_file is empty")
+		}
+		return pin, nil
 	}
 	return nil, fmt.Errorf("no PIN source configured")
 }

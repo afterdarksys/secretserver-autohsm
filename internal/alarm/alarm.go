@@ -20,7 +20,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"strings"
+	"net/url"
 	"time"
 )
 
@@ -44,17 +44,23 @@ type Payload struct {
 
 // New builds a notifier. An empty url yields a no-op notifier so callers do not
 // need to branch. https is required: alarms traverse the network.
-func New(url string, log *slog.Logger) (*Notifier, error) {
-	if url == "" {
+func New(rawURL string, log *slog.Logger) (*Notifier, error) {
+	if rawURL == "" {
 		return &Notifier{log: log}, nil
 	}
-	if !strings.HasPrefix(url, "https://") {
-		return nil, fmt.Errorf("alarm webhook must be https, got %q", url)
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil {
+		return nil, fmt.Errorf("alarm webhook must be an https URL without userinfo, got %q", rawURL)
 	}
 	return &Notifier{
-		url:    url,
-		client: &http.Client{Timeout: 5 * time.Second},
-		log:    log,
+		url: rawURL,
+		client: &http.Client{
+			Timeout: 5 * time.Second,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
+		log: log,
 	}, nil
 }
 

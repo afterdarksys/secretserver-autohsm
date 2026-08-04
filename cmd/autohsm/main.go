@@ -1,5 +1,5 @@
 // Command autohsm keeps a HashiCorp Vault unsealed using key shares that are
-// wrapped by an HSM and bound to this specific node.
+// wrapped by an HSM and bound to a configured node context.
 //
 // Subcommands:
 //
@@ -10,7 +10,7 @@
 package main
 
 import (
-	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"errors"
@@ -37,6 +37,12 @@ const defaultConfigPath = "/etc/autohsm/autohsm.yaml"
 // exitSealed is a distinct code so external monitors can alert on "sealed"
 // without parsing output.
 const exitSealed = 2
+
+// exitTerminal tells systemd that restarting cannot help without operator
+// intervention (for example, stale shares or an unsafe threshold layout).
+const exitTerminal = 78
+
+const maxShareSize = 4096
 
 func main() {
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -67,18 +73,32 @@ func main() {
 	}
 
 	if err != nil {
-		var sealed sealedError
-		if errors.As(err, &sealed) {
+		switch exitCode(err) {
+		case exitSealed:
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(exitSealed)
+		case exitTerminal:
+			log.Error("terminal failure; operator intervention required", "error", err)
+			os.Exit(exitTerminal)
 		}
 		log.Error("fatal", "error", err)
 		os.Exit(1)
 	}
 }
 
+func exitCode(err error) int {
+	var sealed sealedError
+	if errors.As(err, &sealed) {
+		return exitSealed
+	}
+	if errors.Is(err, watch.ErrTerminal) {
+		return exitTerminal
+	}
+	return 1
+}
+
 func usage() {
-	fmt.Fprint(os.Stderr, `autohsm — keep Vault unsealed with HSM-wrapped, node-bound key shares
+	fmt.Fprint(os.Stderr, `autohsm — keep Vault unsealed with HSM-wrapped, context-bound key shares
 
 usage:
   autohsm watch    [--config PATH]              run the daemon (systemd entrypoint)
@@ -221,6 +241,7 @@ func runWatch(cfgPath string, log *slog.Logger) error {
 		Shares:            shares,
 		Interval:          cfg.Watch.Interval,
 		MaxUnsealAttempts: cfg.Watch.MaxUnsealAttempts,
+		StatePath:         "/run/autohsm/submitted-shares",
 		Logger:            log,
 		OnSealed: func(st *vaultclient.SealStatus) {
 			notifier.SealedDetected(ctx, cfg.NodeID, st.Sealed, st.Threshold, st.Shares, st.Progress)
@@ -284,16 +305,11 @@ func runWrap(cfgPath string, args []string) error {
 	defer src.Close()
 
 	fmt.Fprintf(os.Stderr, "reading share %d for node %q from stdin...\n", index, cfg.NodeID)
-	reader := bufio.NewReader(os.Stdin)
-	line, err := reader.ReadString('\n')
-	if err != nil && line == "" {
-		return fmt.Errorf("read share from stdin: %w", err)
+	share, err := readShare(os.Stdin)
+	if err != nil {
+		return err
 	}
-	share := []byte(strings.TrimRight(line, "\r\n"))
 	defer secure.Wipe(share)
-	if len(share) == 0 {
-		return fmt.Errorf("refusing to wrap an empty share")
-	}
 
 	aad := keysource.AAD(cfg.NodeID, index)
 
@@ -322,6 +338,27 @@ func runWrap(cfgPath string, args []string) error {
 	return nil
 }
 
+func readShare(r io.Reader) ([]byte, error) {
+	raw, err := io.ReadAll(io.LimitReader(r, maxShareSize+3))
+	if err != nil {
+		return nil, fmt.Errorf("read share from stdin: %w", err)
+	}
+	share := bytes.TrimRight(raw, "\r\n")
+	if len(share) == 0 {
+		secure.Wipe(raw)
+		return nil, fmt.Errorf("refusing to wrap an empty share")
+	}
+	if len(share) > maxShareSize {
+		secure.Wipe(raw)
+		return nil, fmt.Errorf("share exceeds %d bytes", maxShareSize)
+	}
+	if bytes.IndexByte(share, '\n') >= 0 || bytes.IndexByte(share, '\r') >= 0 {
+		secure.Wipe(raw)
+		return nil, fmt.Errorf("share input must contain exactly one line")
+	}
+	return share, nil
+}
+
 func runSelftest(cfgPath string, log *slog.Logger) error {
 	cfg, vc, src, err := build(cfgPath)
 	if err != nil {
@@ -336,6 +373,9 @@ func runSelftest(cfgPath string, log *slog.Logger) error {
 		return fmt.Errorf("vault unreachable or CA pin wrong: %w", err)
 	}
 	log.Info("vault reachable over pinned TLS", "sealed", st.Sealed, "threshold", st.Threshold)
+	if err := watch.ValidateShareLayout(len(cfg.Keys.Shares), st.Threshold); err != nil {
+		return fmt.Errorf("unsafe share distribution: %w", err)
+	}
 
 	// Prove every configured share unwraps for THIS node before we ever need it.
 	for _, s := range cfg.Keys.Shares {

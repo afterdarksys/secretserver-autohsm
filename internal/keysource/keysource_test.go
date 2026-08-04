@@ -7,6 +7,8 @@ import (
 	"io"
 	"strings"
 	"testing"
+
+	"github.com/miekg/pkcs11"
 )
 
 func testKey(t *testing.T) []byte {
@@ -125,6 +127,82 @@ func TestParseEnvelopeRejectsMalformed(t *testing.T) {
 	for name, raw := range cases {
 		if _, err := ParseEnvelope([]byte(raw)); err == nil {
 			t.Fatalf("%s: malformed envelope accepted", name)
+		}
+	}
+}
+
+func TestParseEnvelopeRejectsWrongNonceAndShortCiphertext(t *testing.T) {
+	for name, env := range map[string]Envelope{
+		"short nonce":      {Nonce: make([]byte, 11), Ciphertext: make([]byte, 17)},
+		"long nonce":       {Nonce: make([]byte, 13), Ciphertext: make([]byte, 17)},
+		"tag only":         {Nonce: make([]byte, 12), Ciphertext: make([]byte, 16)},
+		"short ciphertext": {Nonce: make([]byte, 12), Ciphertext: make([]byte, 15)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := ParseEnvelope([]byte(MarshalEnvelope(env))); err == nil {
+				t.Fatal("invalid envelope accepted")
+			}
+		})
+	}
+}
+
+func secureKeyAttrs() []*pkcs11.Attribute {
+	return []*pkcs11.Attribute{
+		pkcs11.NewAttribute(pkcs11.CKA_VALUE_LEN, uint(32)),
+		pkcs11.NewAttribute(pkcs11.CKA_SENSITIVE, true),
+		pkcs11.NewAttribute(pkcs11.CKA_EXTRACTABLE, false),
+		pkcs11.NewAttribute(pkcs11.CKA_ALWAYS_SENSITIVE, true),
+		pkcs11.NewAttribute(pkcs11.CKA_NEVER_EXTRACTABLE, true),
+		pkcs11.NewAttribute(pkcs11.CKA_ENCRYPT, true),
+		pkcs11.NewAttribute(pkcs11.CKA_DECRYPT, true),
+	}
+}
+
+func TestValidateSecretKeyAttributes(t *testing.T) {
+	if err := validateSecretKeyAttributes(secureKeyAttrs()); err != nil {
+		t.Fatalf("secure AES-256 key rejected: %v", err)
+	}
+
+	for name, typ := range map[string]uint{
+		"not sensitive":          pkcs11.CKA_SENSITIVE,
+		"extractable":            pkcs11.CKA_EXTRACTABLE,
+		"not always sensitive":   pkcs11.CKA_ALWAYS_SENSITIVE,
+		"previously extractable": pkcs11.CKA_NEVER_EXTRACTABLE,
+		"cannot encrypt":         pkcs11.CKA_ENCRYPT,
+		"cannot decrypt":         pkcs11.CKA_DECRYPT,
+	} {
+		t.Run(name, func(t *testing.T) {
+			attrs := secureKeyAttrs()
+			for _, attr := range attrs {
+				if attr.Type == typ {
+					attr.Value = []byte{1 - attr.Value[0]}
+				}
+			}
+			if err := validateSecretKeyAttributes(attrs); err == nil {
+				t.Fatal("unsafe key attributes accepted")
+			}
+		})
+	}
+
+	attrs := secureKeyAttrs()
+	attrs[0] = pkcs11.NewAttribute(pkcs11.CKA_VALUE_LEN, uint(16))
+	if err := validateSecretKeyAttributes(attrs); err == nil {
+		t.Fatal("AES-128 key accepted")
+	}
+}
+
+func TestValidateGCMMechanism(t *testing.T) {
+	good := pkcs11.MechanismInfo{MinKeySize: 16, MaxKeySize: 32, Flags: pkcs11.CKF_ENCRYPT | pkcs11.CKF_DECRYPT}
+	if err := validateGCMMechanism(good); err != nil {
+		t.Fatalf("usable AES-GCM mechanism rejected: %v", err)
+	}
+	for _, bad := range []pkcs11.MechanismInfo{
+		{MinKeySize: 16, MaxKeySize: 32, Flags: pkcs11.CKF_ENCRYPT},
+		{MinKeySize: 16, MaxKeySize: 24, Flags: pkcs11.CKF_ENCRYPT | pkcs11.CKF_DECRYPT},
+		{MinKeySize: 64, MaxKeySize: 64, Flags: pkcs11.CKF_ENCRYPT | pkcs11.CKF_DECRYPT},
+	} {
+		if err := validateGCMMechanism(bad); err == nil {
+			t.Fatalf("unsafe mechanism accepted: %+v", bad)
 		}
 	}
 }
