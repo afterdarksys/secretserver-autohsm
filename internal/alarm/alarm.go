@@ -39,7 +39,7 @@ type Payload struct {
 	Threshold int    `json:"threshold"`
 	Shares    int    `json:"shares"`
 	Progress  int    `json:"progress"`
-	// Error is set only for a vault_unreachable event. It carries an error
+	// Error is set only for vault_unreachable and autohsm_failed events. It carries an error
 	// chain built entirely from fmt.Errorf wrapping in this codebase, never
 	// key material.
 	Error     string `json:"error,omitempty"`
@@ -91,6 +91,19 @@ func (n *Notifier) VaultUnreachable(ctx context.Context, nodeID string, pollErr 
 		Event:  "vault_unreachable",
 		NodeID: nodeID,
 		Error:  pollErr.Error(),
+	})
+}
+
+// DaemonFailed fires when the watch daemon is about to exit on an error: the
+// HSM could not be opened, the PIN was rejected, shares failed to unwrap until
+// the retry budget ran out, or the share layout is unsafe. Once the daemon
+// exits nothing else will report a sealed Vault, so the last word must be an
+// alarm rather than silence.
+func (n *Notifier) DaemonFailed(ctx context.Context, nodeID string, err error) {
+	n.post(ctx, Payload{
+		Event:  "autohsm_failed",
+		NodeID: nodeID,
+		Error:  err.Error(),
 	})
 }
 

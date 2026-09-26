@@ -110,3 +110,23 @@ func TestEmptyWebhookVaultUnreachableIsNoOp(t *testing.T) {
 	}
 	n.VaultUnreachable(context.Background(), "node-1", errors.New("unreachable"))
 }
+
+func TestDaemonFailedPayload(t *testing.T) {
+	var got Payload
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Errorf("decode payload: %v", err)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	n := &Notifier{url: srv.URL, client: srv.Client(), log: discardLogger()}
+	n.DaemonFailed(context.Background(), "node-1", errors.New("pkcs11 login failed: CKR_PIN_INCORRECT"))
+	if got.Event != "autohsm_failed" || got.NodeID != "node-1" || got.Timestamp == "" {
+		t.Fatalf("unexpected payload: %+v", got)
+	}
+	if !strings.Contains(got.Error, "CKR_PIN_INCORRECT") {
+		t.Fatalf("payload did not carry the failure: %+v", got)
+	}
+}

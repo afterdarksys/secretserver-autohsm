@@ -137,24 +137,36 @@ func build(cfgPath string, daemon bool) (*config.Config, *vaultclient.Client, ke
 	if err != nil {
 		return nil, nil, nil, err
 	}
+	vc, src, err := buildFromConfig(cfg, daemon)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return cfg, vc, src, nil
+}
+
+func buildFromConfig(cfg *config.Config, daemon bool) (*vaultclient.Client, keysource.Source, error) {
 	if daemon && cfg.Keys.Source == "pkcs11" && cfg.Keys.PKCS11.PINEnv != "" {
-		return nil, nil, nil, fmt.Errorf(
+		return nil, nil, fmt.Errorf(
 			"keys.pkcs11.pin_env is not allowed for the watch daemon (it stays exposed in /proc/<pid>/environ for the process's entire lifetime); use keys.pkcs11.pin_file instead")
 	}
-	vc, err := vaultclient.New(vaultclient.Config{
+	vc, err := newVaultClient(cfg)
+	if err != nil {
+		return nil, nil, err
+	}
+	src, err := openKeySource(cfg)
+	if err != nil {
+		return nil, nil, err
+	}
+	return vc, src, nil
+}
+
+func newVaultClient(cfg *config.Config) (*vaultclient.Client, error) {
+	return vaultclient.New(vaultclient.Config{
 		Address:    cfg.Vault.Address,
 		CACertPath: cfg.Vault.CACertPath,
 		Timeout:    cfg.Vault.Timeout,
 		MinTLS13:   cfg.Vault.RequireTLS13 != nil && *cfg.Vault.RequireTLS13,
 	})
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	src, err := openKeySource(cfg)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	return cfg, vc, src, nil
 }
 
 func openKeySource(cfg *config.Config) (keysource.Source, error) {
@@ -226,16 +238,35 @@ func hexDecode(s string) ([]byte, error) {
 }
 
 func runWatch(cfgPath string, log *slog.Logger) error {
-	cfg, vc, src, err := build(cfgPath, true)
+	cfg, err := config.Load(cfgPath)
 	if err != nil {
 		return err
 	}
-	defer src.Close()
-
 	notifier, err := alarm.New(cfg.Alarm.WebhookURL, log)
 	if err != nil {
 		return err
 	}
+
+	err = watchWithConfig(cfg, notifier, log)
+	if errors.Is(err, context.Canceled) {
+		log.Info("shutting down")
+		return nil
+	}
+	if err != nil {
+		// Once the daemon exits nothing else reports a sealed Vault, so its
+		// last act is an alarm. The loop's context may already be cancelled;
+		// the notifier's own client timeout bounds this call.
+		notifier.DaemonFailed(context.Background(), cfg.NodeID, err)
+	}
+	return err
+}
+
+func watchWithConfig(cfg *config.Config, notifier *alarm.Notifier, log *slog.Logger) error {
+	vc, src, err := buildFromConfig(cfg, true)
+	if err != nil {
+		return err
+	}
+	defer src.Close()
 
 	shares := make([]watch.Share, 0, len(cfg.Keys.Shares))
 	for _, s := range cfg.Keys.Shares {
@@ -266,12 +297,7 @@ func runWatch(cfgPath string, log *slog.Logger) error {
 		"shares_held", len(shares),
 		"interval", cfg.Watch.Interval.String())
 
-	err = w.Run(ctx)
-	if errors.Is(err, context.Canceled) {
-		log.Info("shutting down")
-		return nil
-	}
-	return err
+	return w.Run(ctx)
 }
 
 func runStatus(cfgPath string) error {
