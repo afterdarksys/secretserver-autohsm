@@ -1,7 +1,7 @@
 BINARY := autohsm
 PKG    := ./cmd/autohsm
 
-.PHONY: all build test test-integration vet lint clean install
+.PHONY: all build build-linux test test-integration e2e deploy-check vet clean
 
 all: vet test build
 
@@ -20,6 +20,16 @@ test-integration:
 		( echo "set AUTOHSM_TEST_MODULE to libsofthsm2.so" >&2; exit 2 )
 	AUTOHSM_TEST_MODULE="$(AUTOHSM_TEST_MODULE)" \
 		go test -timeout 120s -race -tags=integration -run TestSoftHSMPKCS11 -v ./internal/keysource
+
+# Real Vault (file storage, Shamir seal) + three SoftHSM2 nodes, all in
+# disposable local Docker containers. Positive and negative unseal cases.
+e2e:
+	./scripts/e2e.sh
+
+# README install steps + deploy/autohsm.service under systemd, in a
+# disposable privileged Debian 12 container against a disposable Vault.
+deploy-check:
+	./scripts/deploy-check.sh
 
 vet:
 	go vet ./...

@@ -9,8 +9,9 @@
 // inherently trades some of Vault's sealed-at-rest guarantee for availability.
 // Deps: github.com/miekg/pkcs11
 // Example: src, err := keysource.OpenPKCS11(keysource.PKCS11Options{...}); defer src.Close()
-// Status: draft — implemented against the PKCS#11 v2.40 AES-GCM interface but NOT yet
-// exercised against a live token; run `autohsm selftest` on a host with the module present.
+// Status: tested — PKCS#11 v2.40 AES-GCM interface, exercised against SoftHSM 2.6/2.7 by
+// the integration test and scripts/e2e.sh; NOT yet exercised against production hardware,
+// so run `autohsm selftest` on the real token before trusting a deployment.
 // License: proprietary
 // Provenance: original
 package keysource
