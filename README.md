@@ -98,12 +98,19 @@ sudo cp deploy/autohsm.service /etc/systemd/system/
 Create one non-extractable AES-256 key on the token (SoftHSM shown):
 
 ```bash
-softhsm2-util --init-token --slot 0 --label autohsm --so-pin <SO_PIN> --pin <PIN>
-AUTOHSM_PIN=<PIN> pkcs11-tool --module /usr/lib/softhsm/libsofthsm2.so \
+# Debian/Ubuntu SoftHSM: config and token store are group "softhsm", and token
+# files are created owner-only, so the token must be created BY the service user.
+sudo usermod -aG softhsm autohsm
+sudo -u autohsm softhsm2-util --init-token --slot 0 --label autohsm --so-pin <SO_PIN> --pin <PIN>
+sudo -u autohsm AUTOHSM_PIN=<PIN> pkcs11-tool --module /usr/lib/softhsm/libsofthsm2.so \
   --login --pin env:AUTOHSM_PIN \
   --keygen --key-type aes:32 --label autohsm-wrap --private --sensitive \
   --usage-decrypt
 ```
+
+A token created as root is unreadable to the `autohsm` user and every later step
+fails with `pkcs11 initialize: CKR_GENERAL_ERROR`. For a hardware HSM, grant the
+`autohsm` user access to the vendor module's device and config instead.
 
 The daemon verifies at startup that the selected key is AES-256, sensitive,
 always-sensitive, non-extractable, never-extractable, and enabled for AES-GCM
@@ -137,8 +144,11 @@ sudo systemctl enable --now autohsm
 ```
 
 During a partial distributed unseal, each daemon records accepted share indexes in
-`/run/autohsm`. This prevents resubmission after a daemon crash while allowing a host
-reboot or a Vault status reporting zero progress to begin a fresh episode. Terminal
+`/run/autohsm`, keyed to the unseal nonce Vault returned when the share was accepted.
+This prevents resubmission after a daemon crash within the same unseal attempt, while a
+host reboot, a Vault status reporting zero progress, or a different Vault nonce (a new
+attempt, e.g. after a Vault restart) begins a fresh episode. A share that completes the
+unseal is never latched. Terminal
 share rejection exits with status 78, which the supplied systemd unit deliberately
 does not restart.
 
