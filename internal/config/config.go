@@ -149,8 +149,14 @@ func Load(path string) (*Config, error) {
 // for any file whose content is or gates key material — the enforcement
 // happens on the file the OS already has open, so it cannot be bypassed by
 // a TOCTOU swap between check and read.
+//
+// O_NONBLOCK makes opening a FIFO planted at a secret path return at once so
+// the regular-file check can reject it; a plain open would block the daemon
+// forever waiting for a writer. It has no effect on reads of regular files.
+// Symlinks are followed, but every check applies to the file actually opened,
+// so a link can only lead to a file that itself passes the ownership gate.
 func OpenSecretFile(path, purpose string) (*os.File, error) {
-	f, err := os.Open(path)
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return nil, fmt.Errorf("open %s: %w", purpose, err)
 	}

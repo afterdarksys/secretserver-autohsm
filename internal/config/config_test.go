@@ -4,7 +4,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
 const validYAML = `
@@ -83,6 +85,31 @@ func TestLoadRejectsNonRegularFile(t *testing.T) {
 	}
 	if _, err := Load(dir); err == nil {
 		t.Fatal("directory accepted as configuration")
+	}
+}
+
+// Negative: a FIFO at a secret path must be rejected promptly, not block the
+// daemon forever waiting for a writer.
+func TestOpenSecretFileRejectsFIFOWithoutBlocking(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "pin")
+	if err := syscall.Mkfifo(p, 0o600); err != nil {
+		t.Skipf("mkfifo unavailable: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		f, err := OpenSecretFile(p, "pin_file")
+		if f != nil {
+			f.Close()
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "not a regular file") {
+			t.Fatalf("FIFO accepted or wrong error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("OpenSecretFile blocked on a FIFO")
 	}
 }
 
