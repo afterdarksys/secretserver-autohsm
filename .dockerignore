@@ -1,0 +1,6 @@
+.git
+bin
+.omc
+.claude
+.code-review-graph
+*.wrapped

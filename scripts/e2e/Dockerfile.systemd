@@ -1,0 +1,15 @@
+# Disposable Debian 12 host with systemd as PID 1, used by scripts/deploy-check.sh
+# to follow the README install steps literally and run deploy/autohsm.service.
+FROM autohsm-e2e:local AS build
+
+FROM debian:bookworm
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      systemd systemd-sysv dbus softhsm2 opensc sudo curl jq ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+# `make build` output and the repo files the README installs from.
+COPY --from=build /usr/local/bin/autohsm /opt/autohsm/bin/autohsm
+COPY --from=build /src/examples /opt/autohsm/examples
+COPY --from=build /src/deploy /opt/autohsm/deploy
+STOPSIGNAL SIGRTMIN+3
+CMD ["/sbin/init"]
