@@ -77,7 +77,24 @@ type Options struct {
 	// hook). A Vault we cannot even reach is not a reason to stay quiet: it is
 	// exactly the silent-failure condition this package exists to surface.
 	OnUnreachable func(pollErr error)
+	// OnHSMLost fires once per HSM outage (session lost and not re-established);
+	// OnHSMRecovered fires when it comes back.
+	OnHSMLost      func(err error)
+	OnHSMRecovered func()
+	// OnSharesStale fires when Vault rejects the key material itself, then
+	// again with exponential backoff while Vault stays sealed. It replaces
+	// OnSealed while the watcher is in that state.
+	OnSharesStale func(status *vaultclient.SealStatus, err error)
+	// Now overrides the clock (tests only).
+	Now func() time.Time
 }
+
+// maxHSMBackoff caps the delay between HSM reconnect attempts; maxStaleBackoff
+// caps the delay between repeated shares_stale alarms.
+const (
+	maxHSMBackoff   = 5 * time.Minute
+	maxStaleBackoff = time.Hour
+)
 
 // Sealer is the subset of the Vault client the watcher needs.
 type Sealer interface {
@@ -103,6 +120,20 @@ type Watcher struct {
 	// updated. It identifies which sealed episode the latch belongs to.
 	submittedNonce string
 	stateLoaded    bool
+
+	// HSM outage state: while hsmDown, reconnects are attempted no more often
+	// than hsmBackoff, and no unseal is attempted.
+	hsmDown    bool
+	hsmBackoff time.Duration
+	hsmNextTry time.Time
+
+	// sharesStale latches for the life of the process once Vault rejects the
+	// key material: no further submissions, and shares_stale reminders with
+	// backoff instead of a vault_sealed alarm every poll.
+	sharesStale     bool
+	staleErr        error
+	staleBackoff    time.Duration
+	staleNextRemind time.Time
 }
 
 // New builds a watcher.
@@ -116,6 +147,9 @@ func New(v Sealer, src keysource.Source, opts Options) *Watcher {
 	}
 	if opts.MaxUnsealAttempts <= 0 {
 		opts.MaxUnsealAttempts = 5
+	}
+	if opts.Now == nil {
+		opts.Now = time.Now
 	}
 	return &Watcher{vault: v, source: src, opts: opts, log: log, submitted: make(map[int]bool)}
 }
@@ -168,6 +202,13 @@ func (w *Watcher) Tick(ctx context.Context) error {
 		st.Nonce = ""
 	}
 
+	// Probe the HSM on every poll, not only when unsealing, so a lost token is
+	// reported while Vault is still unsealed rather than discovered at the
+	// next reboot.
+	if err := w.checkHSM(ctx); err != nil {
+		return err
+	}
+
 	if !st.Sealed {
 		if w.consecutiveFailures > 0 {
 			w.log.Info("vault is unsealed again", "previous_failures", w.consecutiveFailures)
@@ -181,22 +222,14 @@ func (w *Watcher) Tick(ctx context.Context) error {
 		return nil
 	}
 
-	// A sealed episode's identity is Vault's unseal nonce. Vault reports an
-	// empty nonce while progress is 0 and mints a fresh one when the first
-	// share of an attempt is accepted (the unseal response carries it), so the
-	// latch records the nonce from Vault's reply, never the pre-submission
-	// value. A latch recorded under a different
-	// nonce is stale regardless of Progress: relying on Progress==0 alone
-	// misses the case where a restart spans an unseal->reseal we never
-	// directly observed and a peer has already contributed to the new
-	// episode before our next poll, which would otherwise leave this node
-	// believing it has nothing left to submit for an episode it never
-	// actually acted in. Progress==0 remains the fallback for a Vault that
-	// does not report a nonce.
-	// Any share this node had accepted in the CURRENT attempt was latched
-	// under that attempt's nonce, so a nonempty Vault nonce that differs from
-	// the latch's (including an empty latch nonce from an old state file)
-	// means the latch belongs to an earlier attempt.
+	// A sealed episode's identity is Vault's unseal nonce: empty while
+	// progress is 0, minted when the first share of an attempt is accepted, and
+	// returned in each unseal reply (which is what the latch records). Any
+	// share this node had accepted in the CURRENT attempt was latched under
+	// that attempt's nonce, so a nonempty Vault nonce that differs from the
+	// latch's (including an empty latch nonce from an older state file) means
+	// the latch belongs to an earlier attempt, even when a peer has already
+	// pushed progress above 0. Progress==0 covers a Vault reporting no nonce.
 	stale := len(w.submitted) > 0 &&
 		((st.Nonce != "" && st.Nonce != w.submittedNonce) ||
 			(st.Nonce == "" && st.Progress == 0))
@@ -206,6 +239,21 @@ func (w *Watcher) Tick(ctx context.Context) error {
 		if err := w.removeSubmittedState(); err != nil {
 			return fmt.Errorf("%w: clear stale submission state: %v", ErrTerminal, err)
 		}
+	}
+
+	if w.sharesStale {
+		// Fail closed: never submit again in this process. Remind with
+		// backoff rather than alarming on every poll.
+		w.log.Error("vault is SEALED; not submitting: vault rejected this key material (restart after re-provisioning shares)",
+			"threshold", st.Threshold, "shares", st.Shares, "progress", st.Progress)
+		if now := w.opts.Now(); !now.Before(w.staleNextRemind) {
+			w.staleBackoff = min(w.staleBackoff*2, maxStaleBackoff)
+			w.staleNextRemind = now.Add(w.staleBackoff)
+			if w.opts.OnSharesStale != nil {
+				w.opts.OnSharesStale(st, w.staleErr)
+			}
+		}
+		return nil
 	}
 
 	// Sealed: alarm first, so the operator learns about it even if unsealing fails.
@@ -225,7 +273,23 @@ func (w *Watcher) Tick(ctx context.Context) error {
 		return err
 	}
 
+	if w.hsmDown {
+		w.log.Error("HSM unavailable; cannot unwrap shares", "next_retry", w.hsmNextTry.Format(time.RFC3339))
+		return nil
+	}
+
 	if err := w.submitShares(ctx); err != nil {
+		switch {
+		case errors.Is(err, keysource.ErrPINRejected):
+			return fmt.Errorf("%w: %v", ErrTerminal, err)
+		case errors.Is(err, keysource.ErrHSMUnavailable):
+			// Not the shares' fault: do not consume the unseal budget.
+			w.markHSMDown(err)
+			return nil
+		case vaultclient.IsKeyRejected(err):
+			w.enterSharesStale(st, err)
+			return nil
+		}
 		w.consecutiveFailures++
 		w.log.Error("unseal attempt failed",
 			"error", err,
@@ -241,6 +305,70 @@ func (w *Watcher) Tick(ctx context.Context) error {
 
 	w.consecutiveFailures = 0
 	return nil
+}
+
+// checkHSM probes a source that can lose its device. It returns an error only
+// for a rejected PIN (terminal: retrying burns the token's PIN counter).
+func (w *Watcher) checkHSM(ctx context.Context) error {
+	hc, ok := w.source.(keysource.HealthChecker)
+	if !ok {
+		return nil
+	}
+	if w.hsmDown && w.opts.Now().Before(w.hsmNextTry) {
+		return nil
+	}
+	err := hc.Health(ctx)
+	switch {
+	case err == nil:
+		if w.hsmDown {
+			w.hsmDown, w.hsmBackoff = false, 0
+			w.log.Info("HSM session re-established")
+			if w.opts.OnHSMRecovered != nil {
+				w.opts.OnHSMRecovered()
+			}
+		}
+	case errors.Is(err, keysource.ErrPINRejected):
+		return fmt.Errorf("%w: %v", ErrTerminal, err)
+	default:
+		w.markHSMDown(err)
+	}
+	return nil
+}
+
+// markHSMDown records an HSM outage, alarming once per outage and doubling
+// the reconnect delay (from one poll interval up to maxHSMBackoff).
+func (w *Watcher) markHSMDown(err error) {
+	if !w.hsmDown {
+		w.hsmDown = true
+		w.hsmBackoff = w.opts.Interval
+		w.log.Error("HSM unavailable", "error", err)
+		if w.opts.OnHSMLost != nil {
+			w.opts.OnHSMLost(err)
+		}
+	} else {
+		w.hsmBackoff = min(w.hsmBackoff*2, maxHSMBackoff)
+		w.log.Warn("HSM still unavailable", "error", err, "retry_in", w.hsmBackoff.String())
+	}
+	w.hsmNextTry = w.opts.Now().Add(w.hsmBackoff)
+}
+
+// enterSharesStale latches the fail-closed state after Vault rejected the key
+// material, and alarms immediately.
+func (w *Watcher) enterSharesStale(st *vaultclient.SealStatus, err error) {
+	w.sharesStale = true
+	w.staleErr = err
+	w.staleBackoff = w.opts.Interval
+	w.staleNextRemind = w.opts.Now().Add(w.staleBackoff)
+	clear(w.submitted)
+	w.submittedNonce = ""
+	if rerr := w.removeSubmittedState(); rerr != nil {
+		w.log.Warn("could not clear submission state", "error", rerr)
+	}
+	w.log.Error("vault rejected the unseal key material; shares are stale or wrong for this Vault. Not submitting again until restarted",
+		"error", err)
+	if w.opts.OnSharesStale != nil {
+		w.opts.OnSharesStale(st, err)
+	}
 }
 
 // submitShares unwraps and submits each share this node holds, wiping plaintext

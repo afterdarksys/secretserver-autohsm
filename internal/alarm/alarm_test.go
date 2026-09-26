@@ -130,3 +130,34 @@ func TestDaemonFailedPayload(t *testing.T) {
 		t.Fatalf("payload did not carry the failure: %+v", got)
 	}
 }
+
+func TestHSMAndStaleSharePayloads(t *testing.T) {
+	var got []Payload
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var p Payload
+		if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+			t.Errorf("decode payload: %v", err)
+		}
+		got = append(got, p)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	n := &Notifier{url: srv.URL, client: srv.Client(), log: discardLogger()}
+	n.HSMUnavailable(context.Background(), "node-1", errors.New("HSM unavailable: CKR_DEVICE_REMOVED"))
+	n.HSMRecovered(context.Background(), "node-1")
+	n.SharesStale(context.Background(), "node-1", true, 3, 5, 0, errors.New("vault returned 400 Bad Request: invalid key"))
+	want := []string{"hsm_unavailable", "hsm_recovered", "shares_stale"}
+	if len(got) != len(want) {
+		t.Fatalf("got %d alarms, want %d", len(got), len(want))
+	}
+	for i, ev := range want {
+		if got[i].Event != ev || got[i].NodeID != "node-1" || got[i].Timestamp == "" {
+			t.Fatalf("alarm %d: %+v, want event %s", i, got[i], ev)
+		}
+	}
+	if !strings.Contains(got[0].Error, "CKR_DEVICE_REMOVED") || got[1].Error != "" ||
+		!strings.Contains(got[2].Error, "invalid key") || got[2].Threshold != 3 || !got[2].Sealed {
+		t.Fatalf("payload contents wrong: %+v", got)
+	}
+}

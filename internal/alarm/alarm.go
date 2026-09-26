@@ -39,7 +39,8 @@ type Payload struct {
 	Threshold int    `json:"threshold"`
 	Shares    int    `json:"shares"`
 	Progress  int    `json:"progress"`
-	// Error is set only for vault_unreachable and autohsm_failed events. It carries an error
+	// Error is set for vault_unreachable, autohsm_failed, hsm_unavailable and
+	// shares_stale events. It carries an error
 	// chain built entirely from fmt.Errorf wrapping in this codebase, never
 	// key material.
 	Error     string `json:"error,omitempty"`
@@ -104,6 +105,29 @@ func (n *Notifier) DaemonFailed(ctx context.Context, nodeID string, err error) {
 		Event:  "autohsm_failed",
 		NodeID: nodeID,
 		Error:  err.Error(),
+	})
+}
+
+// HSMUnavailable fires once when the HSM session is lost and cannot be
+// re-established. The daemon keeps retrying with backoff; it does not
+// consume the unseal failure budget while the HSM is down.
+func (n *Notifier) HSMUnavailable(ctx context.Context, nodeID string, err error) {
+	n.post(ctx, Payload{Event: "hsm_unavailable", NodeID: nodeID, Error: err.Error()})
+}
+
+// HSMRecovered fires when a lost HSM session has been re-established.
+func (n *Notifier) HSMRecovered(ctx context.Context, nodeID string) {
+	n.post(ctx, Payload{Event: "hsm_recovered", NodeID: nodeID})
+}
+
+// SharesStale fires when Vault rejects the unseal key material itself (for
+// example shares from before a re-initialisation). The daemon stops
+// submitting until restarted and repeats this alarm with backoff while Vault
+// stays sealed, instead of a vault_sealed alarm on every poll.
+func (n *Notifier) SharesStale(ctx context.Context, nodeID string, sealed bool, threshold, shares, progress int, err error) {
+	n.post(ctx, Payload{
+		Event: "shares_stale", NodeID: nodeID, Sealed: sealed,
+		Threshold: threshold, Shares: shares, Progress: progress, Error: err.Error(),
 	})
 }
 

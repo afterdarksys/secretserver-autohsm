@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/afterdarksys/secretserver-autohsm/internal/keysource"
 	"github.com/afterdarksys/secretserver-autohsm/internal/vaultclient"
@@ -602,5 +603,179 @@ func TestAlarmFiresOnSealed(t *testing.T) {
 	_ = w.Tick(context.Background())
 	if fired != 1 {
 		t.Fatalf("alarm fired %d times, want 1", fired)
+	}
+}
+
+// hsmSource wraps a software source with a controllable device state.
+type hsmSource struct {
+	keysource.Source
+	healthErr   error
+	unwrapErr   error
+	healthCalls int
+}
+
+func (h *hsmSource) Health(context.Context) error {
+	h.healthCalls++
+	return h.healthErr
+}
+
+func (h *hsmSource) Unwrap(ctx context.Context, blob, aad []byte) ([]byte, error) {
+	if h.unwrapErr != nil {
+		return nil, h.unwrapErr
+	}
+	return h.Source.Unwrap(ctx, blob, aad)
+}
+
+type fakeClock struct{ t time.Time }
+
+func (c *fakeClock) now() time.Time          { return c.t }
+func (c *fakeClock) advance(d time.Duration) { c.t = c.t.Add(d) }
+
+func TestHSMOutageAlarmsOnceBacksOffAndRecovers(t *testing.T) {
+	sw, path := setup(t, "apps2", 1, "share-one")
+	src := &hsmSource{Source: sw, healthErr: fmt.Errorf("%w: CKR_DEVICE_REMOVED", keysource.ErrHSMUnavailable)}
+	v := &fakeVault{sealed: true, initted: true}
+	clk := &fakeClock{t: time.Unix(1_000_000, 0)}
+	var lost, recovered int
+	w := New(v, src, Options{
+		NodeID: "apps2", Shares: []Share{{Index: 1, Path: path}}, Interval: time.Second,
+		MaxUnsealAttempts: 1, Logger: quietLogger(), Now: clk.now,
+		OnHSMLost: func(error) { lost++ }, OnHSMRecovered: func() { recovered++ },
+	})
+
+	for i := 0; i < 5; i++ {
+		if err := w.Tick(context.Background()); err != nil {
+			t.Fatalf("HSM outage must not be terminal: %v", err)
+		}
+	}
+	if lost != 1 || len(v.submitted) != 0 || w.consecutiveFailures != 0 {
+		t.Fatalf("lost=%d submitted=%d failures=%d; want 1 alarm, nothing submitted, budget untouched",
+			lost, len(v.submitted), w.consecutiveFailures)
+	}
+	if src.healthCalls != 1 {
+		t.Fatalf("health probed %d times inside the backoff window, want 1", src.healthCalls)
+	}
+	clk.advance(time.Second)
+	_ = w.Tick(context.Background())
+	if src.healthCalls != 2 || w.hsmBackoff != 2*time.Second {
+		t.Fatalf("after backoff: calls=%d backoff=%s, want 2 and 2s", src.healthCalls, w.hsmBackoff)
+	}
+	for i := 0; i < 20; i++ { // backoff is capped
+		clk.advance(maxHSMBackoff)
+		_ = w.Tick(context.Background())
+	}
+	if w.hsmBackoff != maxHSMBackoff || lost != 1 {
+		t.Fatalf("backoff=%s lost=%d, want cap %s and still one alarm", w.hsmBackoff, lost, maxHSMBackoff)
+	}
+
+	src.healthErr = nil
+	clk.advance(maxHSMBackoff)
+	if err := w.Tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if recovered != 1 || len(v.submitted) != 1 {
+		t.Fatalf("recovered=%d submitted=%d, want recovery alarm and the share submitted", recovered, len(v.submitted))
+	}
+}
+
+// A lost HSM must be reported while Vault is still unsealed, not discovered
+// only at the next reboot.
+func TestHSMLossReportedWhileUnsealed(t *testing.T) {
+	sw, path := setup(t, "apps2", 1, "share-one")
+	src := &hsmSource{Source: sw, healthErr: keysource.ErrHSMUnavailable}
+	var lost int
+	w := New(&fakeVault{sealed: false, initted: true}, src, Options{
+		NodeID: "apps2", Shares: []Share{{Index: 1, Path: path}}, Logger: quietLogger(),
+		OnHSMLost: func(error) { lost++ },
+	})
+	if err := w.Tick(context.Background()); err != nil || lost != 1 {
+		t.Fatalf("err=%v lost=%d, want nil and 1", err, lost)
+	}
+}
+
+// Negative: a PIN rejection (initially or on re-login) is terminal so the
+// service manager does not retry and burn the token's PIN counter.
+func TestPINRejectionIsTerminal(t *testing.T) {
+	sw, path := setup(t, "apps2", 1, "share-one")
+	for name, src := range map[string]*hsmSource{
+		"health": {Source: sw, healthErr: keysource.ErrPINRejected},
+		"unwrap": {Source: sw, unwrapErr: keysource.ErrPINRejected},
+	} {
+		v := &fakeVault{sealed: true, initted: true}
+		w := New(v, src, Options{NodeID: "apps2", Shares: []Share{{Index: 1, Path: path}}, Logger: quietLogger(), MaxUnsealAttempts: 5})
+		if err := w.Tick(context.Background()); !errors.Is(err, ErrTerminal) {
+			t.Fatalf("%s: PIN rejection returned %v, want ErrTerminal", name, err)
+		}
+		if len(v.submitted) != 0 {
+			t.Fatalf("%s: submitted after PIN rejection", name)
+		}
+	}
+}
+
+func TestUnwrapHSMLossDoesNotConsumeBudget(t *testing.T) {
+	sw, path := setup(t, "apps2", 1, "share-one")
+	src := &hsmSource{Source: sw, unwrapErr: fmt.Errorf("%w: CKR_SESSION_HANDLE_INVALID", keysource.ErrHSMUnavailable)}
+	var lost int
+	w := New(&fakeVault{sealed: true, initted: true}, src, Options{
+		NodeID: "apps2", Shares: []Share{{Index: 1, Path: path}}, Logger: quietLogger(),
+		MaxUnsealAttempts: 1, OnHSMLost: func(error) { lost++ },
+	})
+	if err := w.Tick(context.Background()); err != nil {
+		t.Fatalf("HSM loss during unwrap was terminal: %v", err)
+	}
+	if lost != 1 || w.consecutiveFailures != 0 || !w.hsmDown {
+		t.Fatalf("lost=%d failures=%d down=%v", lost, w.consecutiveFailures, w.hsmDown)
+	}
+}
+
+// Stale shares (Vault re-initialised): Vault rejects the combined key set.
+// The watcher must alarm shares_stale once, stop submitting for the life of
+// the process, stop per-poll vault_sealed alarms, and remind with backoff.
+func TestStaleSharesLatchFailsClosedWithBackoffAlarms(t *testing.T) {
+	src, path := setup(t, "apps2", 1, "share-one")
+	rejected := &vaultclient.APIError{Method: "PUT", Path: "/v1/sys/unseal", StatusCode: 400, Status: "400 Bad Request",
+		Messages: []string{"unable to retrieve stored keys: invalid key: failed to decrypt keys from storage"}}
+	v := &fakeVault{sealed: true, initted: true, submitErr: rejected}
+	clk := &fakeClock{t: time.Unix(1_000_000, 0)}
+	var stale, sealed int
+	w := New(v, src, Options{
+		NodeID: "apps2", Shares: []Share{{Index: 1, Path: path}}, Interval: time.Second,
+		MaxUnsealAttempts: 1, Logger: quietLogger(), Now: clk.now,
+		OnSealed:      func(*vaultclient.SealStatus) { sealed++ },
+		OnSharesStale: func(*vaultclient.SealStatus, error) { stale++ },
+	})
+	if err := w.Tick(context.Background()); err != nil {
+		t.Fatalf("stale shares must latch, not exit: %v", err)
+	}
+	if stale != 1 || !w.sharesStale {
+		t.Fatalf("stale alarms=%d latched=%v, want 1 and true", stale, w.sharesStale)
+	}
+
+	v.mu.Lock()
+	v.submitErr = nil // even if Vault would now accept, we must not submit
+	v.mu.Unlock()
+	sealedBefore := sealed
+	for i := 0; i < 10; i++ {
+		clk.advance(100 * time.Millisecond)
+		if err := w.Tick(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(v.submitted) != 0 {
+		t.Fatalf("submitted %d shares after stale latch", len(v.submitted))
+	}
+	if sealed != sealedBefore {
+		t.Fatalf("vault_sealed alarmed %d times in stale state, want 0", sealed-sealedBefore)
+	}
+	// 1s of polls at 100ms: exactly one reminder (after the 1s backoff).
+	if stale != 2 {
+		t.Fatalf("stale alarms after 1s = %d, want 2 (initial + one reminder)", stale)
+	}
+	for i := 0; i < 100; i++ {
+		clk.advance(time.Minute)
+		_ = w.Tick(context.Background())
+	}
+	if w.staleBackoff != maxStaleBackoff {
+		t.Fatalf("stale reminder backoff %s, want capped at %s", w.staleBackoff, maxStaleBackoff)
 	}
 }

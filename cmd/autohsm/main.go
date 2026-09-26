@@ -288,6 +288,15 @@ func watchWithConfig(cfg *config.Config, notifier *alarm.Notifier, log *slog.Log
 		OnUnreachable: func(pollErr error) {
 			notifier.VaultUnreachable(ctx, cfg.NodeID, pollErr)
 		},
+		OnHSMLost: func(hsmErr error) {
+			notifier.HSMUnavailable(ctx, cfg.NodeID, hsmErr)
+		},
+		OnHSMRecovered: func() {
+			notifier.HSMRecovered(ctx, cfg.NodeID)
+		},
+		OnSharesStale: func(st *vaultclient.SealStatus, staleErr error) {
+			notifier.SharesStale(ctx, cfg.NodeID, st.Sealed, st.Threshold, st.Shares, st.Progress, staleErr)
+		},
 	})
 
 	log.Info("autohsm watching",
