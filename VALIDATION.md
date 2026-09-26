@@ -6,8 +6,9 @@ date; rerun the commands to reproduce them. Nothing touched a real Vault or any
 afterdarksys host. All Vault, HSM and systemd testing used disposable local Docker
 containers.
 
-There were two rounds. The second round fixed issues raised by an independent
-review, plus limits the first round had documented.
+There were three rounds. The second round fixed issues raised by an independent
+review, plus limits the first round had documented. The third round made the
+daemon survive an HSM that is absent at startup.
 
 ## Environment
 
@@ -24,11 +25,19 @@ review, plus limits the first round had documented.
 | Check | Command | Result |
 |---|---|---|
 | Static analysis | `go vet ./...`, `gofmt -l .` | clean |
-| Unit tests (race) | `go test -race -count=1 ./...` | 125 passed, 0 failed, 0 skipped |
+| Unit tests (race) | `go test -race -count=1 ./...` | 126 passed, 0 failed, 0 skipped |
 | Makefile | `make all` (vet, test, build) | pass |
-| PKCS#11 integration | `make test-integration AUTOHSM_TEST_MODULE=.../libsofthsm2.so` | pass (includes session-loss recovery and wrong PIN) |
-| End-to-end | `make e2e` (`scripts/e2e.sh`) | 53/53 checks |
-| Deployment | `make deploy-check` (`scripts/deploy-check.sh`) | 15/15 checks |
+| PKCS#11 integration | `make test-integration AUTOHSM_TEST_MODULE=.../libsofthsm2.so` | pass: `TestSoftHSMPKCS11` (session-loss recovery, wrong PIN) and `TestSoftHSMStartupWithoutToken` (round 3) |
+| End-to-end | `make e2e` (`scripts/e2e.sh`) | 53/53 checks at round 2; **not rerun in round 3** (see below) |
+| Deployment | `make deploy-check` (`scripts/deploy-check.sh`) | 15/15 checks at round 2; **not rerun in round 3** |
+
+Round 3 note: the Docker VM had 3.3 GB free (`docker run --rm alpine df -h /`),
+below the agreed 4 GB threshold, with other agents' containers running. So the
+Docker harnesses were not rerun. The round-3 change was verified with unit tests
+and the SoftHSM integration test only. The e2e "HSM token missing" case was
+updated to the new behaviour (daemon keeps running, exit 124 at the 15 s timeout,
+reason "HSM unavailable", `hsm_unavailable` alarm) but **has not been run**.
+deploy-check does not exercise this path.
 
 ### End-to-end (`scripts/e2e.sh`)
 
@@ -62,7 +71,7 @@ Negative cases. Each one must meet all of these:
 | Wrong HSM PIN | exit 78, never retried | HSM rejected the PIN |
 | Vault certificate from an untrusted CA | keeps polling, never submits (killed at 15 s) | certificate signed by unknown authority |
 | Node holds >= threshold shares | exit 78 | meeting Vault's threshold |
-| HSM token missing | exit 1 at startup | no token with label |
+| HSM token missing | exit 1 at startup (round 2); round 3 changes this to "keeps running, never submits" — updated in the script, not yet run | no token with label → HSM unavailable |
 
 Additional scenarios:
 - **Two good nodes plus one tampered node:** progress reaches 2/3 and Vault stays
@@ -131,6 +140,29 @@ Each code fix has a regression test that fails on the pre-fix code.
 | Nits | watcher log, deploy-check, e2e labels | Log wording is neutral when a peer completed the unseal. The deploy-check message is corrected. The untrusted-CA case is relabelled. The latch comment is corrected: Vault ignores duplicate parts. |
 | Docs | `README.md`, `deploy/autohsm.service` | Hardware-HSM section: drop-in with ReadWritePaths / ProcSubset=all / AF_NETLINK / SupplementaryGroups, a udev rule, and selftest under the sandbox via `systemd-run`. |
 
+### Round 3
+
+| Severity | Location | Defect / change |
+|---|---|---|
+| Medium (availability) | `internal/keysource/pkcs11.go`, `cmd/autohsm/main.go`, `internal/watch` | An HSM absent at startup made `watch` exit 1. systemd retried 5 times in 5 minutes and then gave up, so a token attached a few minutes after boot left Vault sealed. Startup failures are now classified. **Retryable** (`ErrHSMUnavailable`): C_Initialize, slot list, token absent, open session, and non-PIN login failures. The daemon opens with `DeferUnavailable`, so for these it starts disconnected and follows the mid-run outage path: `hsm_unavailable` once, backoff up to 5 min, nothing submitted, budget untouched, `hsm_recovered` on reconnect. **Terminal, exit 78**: `ErrPINRejected`; `ErrHSMMisconfigured` (module cannot load, no AES-GCM, key missing, ambiguous or unsafe, PIN source unusable); and any config or CA error in `watch`. Wrong-node and tampered shares remain terminal through the unwrap budget. Short-lived commands (`selftest`, `wrap`) still fail immediately. |
+
+`TestSoftHSMStartupWithoutToken` (in `internal/watch`, tag `integration`) runs
+against real SoftHSM 2.7:
+- It provisions a token and wraps a share through it.
+- Wrong PIN and a missing key label are rejected at open even with
+  `DeferUnavailable`.
+- It renames the token store away. `OpenPKCS11` without deferral returns
+  `ErrHSMUnavailable`; with deferral it returns a source.
+- Six watcher polls against a Vault-faithful fake produce exactly one
+  `hsm_unavailable`, no submission, no budget use, and a backoff above one
+  interval.
+- It restores the token store and has two peers contribute. The next poll after
+  the backoff produces one `hsm_recovered` and one submission unwrapped by the real
+  token, and Vault is unsealed.
+
+Unit tests cover the watcher treating `ErrHSMMisconfigured` as terminal, from both
+the probe and the unwrap path, and `exitCode` mapping it to 78.
+
 ## Security review notes
 
 - **Envelope:** AES-256-GCM with a 12-byte nonce from the token or `crypto/rand`.
@@ -195,9 +227,6 @@ Cannot be wiped by this code:
   e2e does not simulate an HSM outage under a running daemon. SoftHSM keeps working
   from its cache when files disappear, so a mid-run outage could not be produced
   that way.
-- **An HSM missing at startup still exits 1.** systemd retries it 5 times in 5
-  minutes and then gives up, and `autohsm_failed` is raised. Reconnect with backoff
-  applies only after a successful start.
 - **Only the node that submits the threshold share sees the stale-share
   rejection.** Vault's rejection does not say which share is stale, so that node
   alone raises `shares_stale` and stops. Peers resubmit once, then wait at progress
