@@ -56,6 +56,11 @@ func (f *fakeVault) SubmitUnsealShare(_ context.Context, share []byte) (*vaultcl
 	}
 	if f.unsealAfter > 0 && len(f.submitted) >= f.unsealAfter {
 		f.sealed = false
+		if f.mintNonce {
+			// Real Vault discards the attempt (and its nonce) once unsealed.
+			f.submitted = nil
+			f.nonce = ""
+		}
 	}
 	return &vaultclient.SealStatus{Sealed: f.sealed, Initialized: true, Threshold: 3, Progress: len(f.submitted), Nonce: f.nonce}, nil
 }
@@ -289,6 +294,60 @@ func TestLatchUsesNonceFromUnsealResponse(t *testing.T) {
 	}
 	if got := len(v.submitted); got != 2 {
 		t.Fatalf("same attempt resubmitted: %d submissions, want 2", got)
+	}
+}
+
+// Regression (reproduced against Vault 1.20 in scripts/e2e.sh): when this
+// node's share completes the unseal, Vault's reply carries no nonce. If that
+// share was latched and Vault restarted before our next poll, a peer that
+// contributed first to the new attempt left this node convinced it had
+// already contributed, and the unseal stalled one share short.
+func TestShareThatCompletesUnsealIsNotLatched(t *testing.T) {
+	src, path := setup(t, "apps2", 3, "share-three")
+	statePath := filepath.Join(t.TempDir(), "submitted")
+	v := &fakeVault{sealed: true, initted: true, mintNonce: true, unsealAfter: 1}
+	w := New(v, src, Options{
+		NodeID: "apps2", Shares: []Share{{Index: 3, Path: path}}, StatePath: statePath, Logger: quietLogger(),
+	})
+	if err := w.Tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(statePath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("latch persisted for a share that completed the unseal: %v", err)
+	}
+
+	// Vault restarts before our next poll; a peer contributes first.
+	v.mu.Lock()
+	v.sealed, v.unsealAfter = true, 0
+	v.mu.Unlock()
+	if _, err := v.SubmitUnsealShare(context.Background(), []byte("peer-share")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(v.submitted); got != 2 {
+		t.Fatalf("new attempt got %d submissions, want 2 (peer + this node)", got)
+	}
+}
+
+// A latch persisted without a nonce (older state file) cannot belong to an
+// attempt that Vault identifies by a nonce, so it must not suppress this node.
+func TestNoncelessLatchIsStaleWhenVaultReportsNonce(t *testing.T) {
+	src, path := setup(t, "apps2", 1, "share-one")
+	statePath := filepath.Join(t.TempDir(), "submitted")
+	if err := os.WriteFile(statePath, []byte("1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	v := &fakeVault{sealed: true, initted: true, nonce: "peer-attempt", submitted: [][]byte{[]byte("peer")}}
+	w := New(v, src, Options{
+		NodeID: "apps2", Shares: []Share{{Index: 1, Path: path}}, StatePath: statePath, Logger: quietLogger(),
+	})
+	if err := w.Tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(v.submitted); got != 2 {
+		t.Fatalf("got %d submissions, want 2 (peer + this node)", got)
 	}
 }
 

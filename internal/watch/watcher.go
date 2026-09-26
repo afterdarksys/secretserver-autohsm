@@ -192,8 +192,12 @@ func (w *Watcher) Tick(ctx context.Context) error {
 	// believing it has nothing left to submit for an episode it never
 	// actually acted in. Progress==0 remains the fallback for a Vault that
 	// does not report a nonce.
+	// Any share this node had accepted in the CURRENT attempt was latched
+	// under that attempt's nonce, so a nonempty Vault nonce that differs from
+	// the latch's (including an empty latch nonce from an old state file)
+	// means the latch belongs to an earlier attempt.
 	stale := len(w.submitted) > 0 &&
-		((st.Nonce != "" && w.submittedNonce != "" && st.Nonce != w.submittedNonce) ||
+		((st.Nonce != "" && st.Nonce != w.submittedNonce) ||
 			(st.Nonce == "" && st.Progress == 0))
 	if stale {
 		clear(w.submitted)
@@ -267,6 +271,20 @@ func (w *Watcher) submitShares(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("submit share %d: %w", sh.Index, err)
 		}
+		if !st.Sealed {
+			// This share completed the unseal, so the attempt is over and
+			// there is nothing to latch. Persisting it (Vault reports no nonce
+			// once unsealed) would leave a latch that a later attempt, begun
+			// before our next poll, could mistake for its own.
+			clear(w.submitted)
+			w.submittedNonce = ""
+			if err := w.removeSubmittedState(); err != nil {
+				w.log.Warn("could not clear submission state", "error", err)
+			}
+			w.log.Info("submitted unseal share; vault unsealed",
+				"index", sh.Index, "share_fp", fingerprint.Of(blob))
+			return nil
+		}
 		w.submitted[sh.Index] = true
 		// Record the episode nonce Vault returned for THIS submission. The
 		// seal-status nonce observed before submitting is empty for the first
@@ -287,11 +305,6 @@ func (w *Watcher) submitShares(ctx context.Context) error {
 			"progress", st.Progress,
 			"threshold", st.Threshold,
 			"sealed", st.Sealed)
-
-		if !st.Sealed {
-			w.log.Info("vault unsealed")
-			return nil
-		}
 	}
 	// Not an error: this node legitimately may hold fewer than the threshold,
 	// with peers supplying the rest. Staying below threshold is the design.
