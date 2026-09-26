@@ -300,12 +300,18 @@ func watchWithConfig(cfg *config.Config, notifier *alarm.Notifier, log *slog.Log
 	return w.Run(ctx)
 }
 
+// runStatus needs only the config and the pinned Vault client. It never opens
+// the HSM: a cron monitor must not require (or exercise) the PIN, and an HSM
+// outage must not mask Vault's seal state.
 func runStatus(cfgPath string) error {
-	_, vc, src, err := build(cfgPath, false)
+	cfg, err := config.Load(cfgPath)
 	if err != nil {
 		return err
 	}
-	defer src.Close()
+	vc, err := newVaultClient(cfg)
+	if err != nil {
+		return err
+	}
 
 	st, err := vc.SealStatus(context.Background())
 	if err != nil {

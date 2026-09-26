@@ -2,8 +2,11 @@ package main
 
 import (
 	"bytes"
+	"encoding/pem"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -96,5 +99,52 @@ func TestReadShareRejectsUnsafeInput(t *testing.T) {
 				t.Fatal("unsafe share input accepted")
 			}
 		})
+	}
+}
+
+// status is the cron-monitor entrypoint: it must report seal state without
+// opening the HSM. The config below points at a PKCS#11 module and PIN file
+// that do not exist, so any attempt to open the key source would fail.
+func TestStatusDoesNotOpenHSM(t *testing.T) {
+	sealed := true
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/sys/seal-status" {
+			t.Errorf("unexpected request %s", r.URL.Path)
+		}
+		fmt.Fprintf(w, `{"type":"shamir","initialized":true,"sealed":%t,"t":3,"n":5}`, sealed)
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	ca := filepath.Join(dir, "ca.pem")
+	if err := os.WriteFile(ca, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := fmt.Sprintf(`
+node_id: apps2
+vault:
+  address: %s
+  ca_cert_path: %s
+keys:
+  source: pkcs11
+  pkcs11:
+    module_path: %s
+    key_label: autohsm-wrap
+    pin_file: %s
+  shares:
+    - index: 1
+      path: %s
+`, srv.URL, ca, filepath.Join(dir, "missing-module.so"), filepath.Join(dir, "missing-pin"), filepath.Join(dir, "missing-share"))
+	p := filepath.Join(dir, "autohsm.yaml")
+	if err := os.WriteFile(p, []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := runStatus(p); exitCode(err) != exitSealed {
+		t.Fatalf("sealed vault: runStatus()=%v, want exit %d", err, exitSealed)
+	}
+	sealed = false
+	if err := runStatus(p); err != nil {
+		t.Fatalf("unsealed vault: runStatus()=%v, want nil", err)
 	}
 }
