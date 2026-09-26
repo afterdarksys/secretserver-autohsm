@@ -180,8 +180,11 @@ func (w *Watcher) Tick(ctx context.Context) error {
 		return nil
 	}
 
-	// A sealed episode's identity is Vault's unseal nonce, minted fresh each
-	// time Vault transitions to sealed. A latch recorded under a different
+	// A sealed episode's identity is Vault's unseal nonce. Vault reports an
+	// empty nonce while progress is 0 and mints a fresh one when the first
+	// share of an attempt is accepted (the unseal response carries it), so the
+	// latch records the nonce from Vault's reply, never the pre-submission
+	// value. A latch recorded under a different
 	// nonce is stale regardless of Progress: relying on Progress==0 alone
 	// misses the case where a restart spans an unseal->reseal we never
 	// directly observed and a peer has already contributed to the new
@@ -217,7 +220,7 @@ func (w *Watcher) Tick(ctx context.Context) error {
 		return err
 	}
 
-	if err := w.submitShares(ctx, st.Nonce); err != nil {
+	if err := w.submitShares(ctx); err != nil {
 		w.consecutiveFailures++
 		w.log.Error("unseal attempt failed",
 			"error", err,
@@ -237,7 +240,7 @@ func (w *Watcher) Tick(ctx context.Context) error {
 
 // submitShares unwraps and submits each share this node holds, wiping plaintext
 // as soon as Vault has consumed it.
-func (w *Watcher) submitShares(ctx context.Context, nonce string) error {
+func (w *Watcher) submitShares(ctx context.Context) error {
 	for _, sh := range w.opts.Shares {
 		if w.submitted[sh.Index] {
 			continue
@@ -265,7 +268,15 @@ func (w *Watcher) submitShares(ctx context.Context, nonce string) error {
 			return fmt.Errorf("submit share %d: %w", sh.Index, err)
 		}
 		w.submitted[sh.Index] = true
-		w.submittedNonce = nonce
+		// Record the episode nonce Vault returned for THIS submission. The
+		// seal-status nonce observed before submitting is empty for the first
+		// share of an attempt, and a latch keyed to "" can never be recognised
+		// as stale once a later episode mints a different nonce.
+		if strings.ContainsAny(st.Nonce, "\n\r") {
+			w.log.Warn("vault returned a malformed unseal nonce; ignoring it")
+			st.Nonce = ""
+		}
+		w.submittedNonce = st.Nonce
 		if err := w.persistSubmittedState(); err != nil {
 			return fmt.Errorf("%w: persist accepted share %d: %v", ErrTerminal, sh.Index, err)
 		}

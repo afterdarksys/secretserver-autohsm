@@ -3,6 +3,7 @@ package watch
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -26,6 +27,10 @@ type fakeVault struct {
 	// nonce identifies the current sealed episode, mirroring Vault's real
 	// seal-status "nonce" field.
 	nonce string
+	// mintNonce mirrors real Vault: the nonce is empty while progress is 0
+	// and a fresh one is minted when the first share of an attempt arrives.
+	mintNonce bool
+	minted    int
 }
 
 func (f *fakeVault) SealStatus(context.Context) (*vaultclient.SealStatus, error) {
@@ -45,10 +50,23 @@ func (f *fakeVault) SubmitUnsealShare(_ context.Context, share []byte) (*vaultcl
 	}
 	cp := append([]byte(nil), share...)
 	f.submitted = append(f.submitted, cp)
+	if f.mintNonce && f.nonce == "" {
+		f.minted++
+		f.nonce = fmt.Sprintf("vault-nonce-%d", f.minted)
+	}
 	if f.unsealAfter > 0 && len(f.submitted) >= f.unsealAfter {
 		f.sealed = false
 	}
-	return &vaultclient.SealStatus{Sealed: f.sealed, Initialized: true, Threshold: 3, Progress: len(f.submitted)}, nil
+	return &vaultclient.SealStatus{Sealed: f.sealed, Initialized: true, Threshold: 3, Progress: len(f.submitted), Nonce: f.nonce}, nil
+}
+
+// resetAttempt mirrors a Vault restart or `sys/unseal reset`: progress and
+// nonce are discarded.
+func (f *fakeVault) resetAttempt() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.submitted = nil
+	f.nonce = ""
 }
 
 func quietLogger() *slog.Logger {
@@ -225,6 +243,52 @@ func TestStaleLatchClearsOnNonceChangeEvenWithNonzeroProgress(t *testing.T) {
 	}
 	if got := len(v.submitted); got != 2 {
 		t.Fatalf("episode B: got %d total submissions, want 2 (peer + this node)", got)
+	}
+}
+
+// Regression (reproduced against Vault 1.20 in scripts/e2e.sh): real Vault
+// reports an empty nonce at progress 0 and mints one on the first accepted
+// share. The latch must therefore record the nonce from the unseal RESPONSE.
+// Recording the pre-submission (empty) nonce meant that after an unobserved
+// reset, a peer contributing first left this node convinced it had already
+// contributed, and the unseal stalled below threshold.
+func TestLatchUsesNonceFromUnsealResponse(t *testing.T) {
+	src, path := setup(t, "apps2", 1, "share-one")
+	statePath := filepath.Join(t.TempDir(), "submitted")
+	v := &fakeVault{sealed: true, initted: true, mintNonce: true}
+	opts := Options{
+		NodeID: "apps2", Shares: []Share{{Index: 1, Path: path}}, StatePath: statePath, Logger: quietLogger(),
+	}
+
+	if err := New(v, src, opts).Tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	state, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "nonce:vault-nonce-1\n1\n"; string(state) != want {
+		t.Fatalf("persisted latch %q, want %q", state, want)
+	}
+
+	// Unobserved reset, then a peer contributes first to the new attempt.
+	v.resetAttempt()
+	if _, err := v.SubmitUnsealShare(context.Background(), []byte("peer-share")); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := New(v, src, opts).Tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(v.submitted); got != 2 {
+		t.Fatalf("new attempt got %d submissions, want 2 (peer + this node)", got)
+	}
+	// And the refreshed latch must stop a third submission in the same attempt.
+	if err := New(v, src, opts).Tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(v.submitted); got != 2 {
+		t.Fatalf("same attempt resubmitted: %d submissions, want 2", got)
 	}
 }
 
