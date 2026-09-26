@@ -27,6 +27,7 @@ func TestExitCode(t *testing.T) {
 		{"terminal", fmt.Errorf("watch: %w", watch.ErrTerminal), exitTerminal},
 		{"pin rejected", fmt.Errorf("open: %w", keysource.ErrPINRejected), exitTerminal},
 		{"hsm unavailable", fmt.Errorf("open: %w", keysource.ErrHSMUnavailable), 1},
+		{"hsm misconfigured", fmt.Errorf("open: %w", keysource.ErrHSMMisconfigured), exitTerminal},
 		{"ordinary", errors.New("network down"), 1},
 	}
 	for _, tt := range tests {

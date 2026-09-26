@@ -280,7 +280,7 @@ func (w *Watcher) Tick(ctx context.Context) error {
 
 	if err := w.submitShares(ctx); err != nil {
 		switch {
-		case errors.Is(err, keysource.ErrPINRejected):
+		case errors.Is(err, keysource.ErrPINRejected), errors.Is(err, keysource.ErrHSMMisconfigured):
 			return fmt.Errorf("%w: %v", ErrTerminal, err)
 		case errors.Is(err, keysource.ErrHSMUnavailable):
 			// Not the shares' fault: do not consume the unseal budget.
@@ -308,7 +308,8 @@ func (w *Watcher) Tick(ctx context.Context) error {
 }
 
 // checkHSM probes a source that can lose its device. It returns an error only
-// for a rejected PIN (terminal: retrying burns the token's PIN counter).
+// for a rejected PIN (retrying burns the token's PIN counter) or an unusable
+// HSM configuration/key (retrying cannot help); both are terminal.
 func (w *Watcher) checkHSM(ctx context.Context) error {
 	hc, ok := w.source.(keysource.HealthChecker)
 	if !ok {
@@ -327,7 +328,7 @@ func (w *Watcher) checkHSM(ctx context.Context) error {
 				w.opts.OnHSMRecovered()
 			}
 		}
-	case errors.Is(err, keysource.ErrPINRejected):
+	case errors.Is(err, keysource.ErrPINRejected), errors.Is(err, keysource.ErrHSMMisconfigured):
 		return fmt.Errorf("%w: %v", ErrTerminal, err)
 	default:
 		w.markHSMDown(err)

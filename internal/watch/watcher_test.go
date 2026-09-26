@@ -694,12 +694,15 @@ func TestHSMLossReportedWhileUnsealed(t *testing.T) {
 }
 
 // Negative: a PIN rejection (initially or on re-login) is terminal so the
-// service manager does not retry and burn the token's PIN counter.
+// service manager does not retry and burn the token's PIN counter; an unusable
+// HSM configuration or key is terminal because retrying cannot fix it.
 func TestPINRejectionIsTerminal(t *testing.T) {
 	sw, path := setup(t, "apps2", 1, "share-one")
 	for name, src := range map[string]*hsmSource{
-		"health": {Source: sw, healthErr: keysource.ErrPINRejected},
-		"unwrap": {Source: sw, unwrapErr: keysource.ErrPINRejected},
+		"pin health":           {Source: sw, healthErr: keysource.ErrPINRejected},
+		"pin unwrap":           {Source: sw, unwrapErr: keysource.ErrPINRejected},
+		"misconfigured health": {Source: sw, healthErr: fmt.Errorf("%w: no AES secret key labelled", keysource.ErrHSMMisconfigured)},
+		"misconfigured unwrap": {Source: sw, unwrapErr: fmt.Errorf("%w: key is unsafe", keysource.ErrHSMMisconfigured)},
 	} {
 		v := &fakeVault{sealed: true, initted: true}
 		w := New(v, src, Options{NodeID: "apps2", Shares: []Share{{Index: 1, Path: path}}, Logger: quietLogger(), MaxUnsealAttempts: 5})

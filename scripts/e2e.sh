@@ -163,7 +163,12 @@ negative "node holds >= threshold shares" n3 "$(on n3 mkbad unsafe-layout n3 3)"
 cfg=$(on n3 mkbad missing-token n3 3)
 docker exec "$PFX-n3" mv /var/lib/softhsm/tokens /var/lib/softhsm/tokens.gone
 docker exec "$PFX-n3" install -d -m 0700 /var/lib/softhsm/tokens
-negative "HSM token missing" n3 "$cfg" 1 "no token with label"
+# Absent at startup: the daemon must NOT exit (same reconnect-with-backoff path
+# as a mid-run outage); it keeps running, submits nothing, and alarms once.
+negative "HSM token missing at startup (waits, never submits)" n3 "$cfg" 124 "HSM unavailable"
+if docker exec "$PFX-alarms" sh -c "grep '\"event\":\"hsm_unavailable\"' /e2e/alarms.jsonl | grep -q '\"node_id\":\"n3\"'"; then
+  pass "HSM token missing at startup: hsm_unavailable alarm delivered"
+else fail "HSM token missing at startup: no hsm_unavailable alarm"; fi
 docker exec "$PFX-n3" sh -c 'rm -rf /var/lib/softhsm/tokens && mv /var/lib/softhsm/tokens.gone /var/lib/softhsm/tokens'
 
 echo "== NEGATIVE: two good nodes + one bad node cannot reach threshold"

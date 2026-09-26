@@ -92,8 +92,10 @@ func exitCode(err error) int {
 		return exitSealed
 	}
 	// A rejected PIN is terminal: a restart loop would retry C_Login and burn
-	// a hardware token's PIN retry counter.
-	if errors.Is(err, watch.ErrTerminal) || errors.Is(err, keysource.ErrPINRejected) {
+	// a hardware token's PIN retry counter. An unusable HSM configuration or
+	// key cannot be fixed by restarting either.
+	if errors.Is(err, watch.ErrTerminal) || errors.Is(err, keysource.ErrPINRejected) ||
+		errors.Is(err, keysource.ErrHSMMisconfigured) {
 		return exitTerminal
 	}
 	return 1
@@ -155,7 +157,7 @@ func buildFromConfig(cfg *config.Config, daemon bool) (*vaultclient.Client, keys
 	if err != nil {
 		return nil, nil, err
 	}
-	src, err := openKeySource(cfg)
+	src, err := openKeySource(cfg, daemon)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -171,7 +173,11 @@ func newVaultClient(cfg *config.Config) (*vaultclient.Client, error) {
 	})
 }
 
-func openKeySource(cfg *config.Config) (keysource.Source, error) {
+// openKeySource opens the configured key source. For the watch daemon
+// (deferUnavailable) an HSM that is merely absent at startup does not fail
+// the open: the watcher's HSM probe reconnects with backoff and alarms, the
+// same path as a mid-run outage. Short-lived commands fail immediately.
+func openKeySource(cfg *config.Config, deferUnavailable bool) (keysource.Source, error) {
 	switch cfg.Keys.Source {
 	case "pkcs11":
 		// The PIN is re-read (pin_file) for each login, including a re-login
@@ -181,6 +187,8 @@ func openKeySource(cfg *config.Config) (keysource.Source, error) {
 			TokenLabel: cfg.Keys.PKCS11.TokenLabel,
 			KeyLabel:   cfg.Keys.PKCS11.KeyLabel,
 			ReadPIN:    cfg.Keys.PKCS11.ResolvePIN,
+
+			DeferUnavailable: deferUnavailable,
 		})
 	case "file":
 		// Development only; config.Validate already required the explicit opt-in.
@@ -237,13 +245,15 @@ func hexDecode(s string) ([]byte, error) {
 }
 
 func runWatch(cfgPath string, log *slog.Logger) error {
+	// Configuration errors are terminal (exit 78): restarting cannot fix a
+	// file an operator has to edit.
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: %w", watch.ErrTerminal, err)
 	}
 	notifier, err := alarm.New(cfg.Alarm.WebhookURL, log)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: %w", watch.ErrTerminal, err)
 	}
 
 	err = watchWithConfig(cfg, notifier, log)
@@ -263,7 +273,9 @@ func runWatch(cfgPath string, log *slog.Logger) error {
 func watchWithConfig(cfg *config.Config, notifier *alarm.Notifier, log *slog.Logger) error {
 	vc, src, err := buildFromConfig(cfg, true)
 	if err != nil {
-		return err
+		// With DeferUnavailable, anything left here is configuration (CA,
+		// pin_env, module, key) or a rejected PIN: terminal.
+		return fmt.Errorf("%w: %w", watch.ErrTerminal, err)
 	}
 	defer src.Close()
 

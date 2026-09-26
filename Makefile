@@ -19,7 +19,7 @@ test-integration:
 	@test -n "$(AUTOHSM_TEST_MODULE)" || \
 		( echo "set AUTOHSM_TEST_MODULE to libsofthsm2.so" >&2; exit 2 )
 	AUTOHSM_TEST_MODULE="$(AUTOHSM_TEST_MODULE)" \
-		go test -timeout 120s -race -tags=integration -run TestSoftHSMPKCS11 -v ./internal/keysource
+		go test -timeout 120s -race -tags=integration -run TestSoftHSM -v ./internal/keysource ./internal/watch
 
 # Real Vault (file storage, Shamir seal) + three SoftHSM2 nodes, all in
 # disposable local Docker containers. Positive and negative unseal cases.

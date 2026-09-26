@@ -43,6 +43,11 @@ var ErrPINRejected = errors.New("HSM rejected the PIN")
 // transient: a later call retries the connection.
 var ErrHSMUnavailable = errors.New("HSM unavailable")
 
+// ErrHSMMisconfigured reports a failure that retrying cannot fix: the module
+// cannot be loaded, the token lacks AES-GCM, the key is missing, ambiguous or
+// unsafe, or the PIN source is unusable. It is terminal.
+var ErrHSMMisconfigured = errors.New("HSM configuration or key is unusable")
+
 // PKCS11Options describes how to reach the token and which key to use.
 type PKCS11Options struct {
 	ModulePath string
@@ -52,6 +57,13 @@ type PKCS11Options struct {
 	// re-login after a lost session. The source wipes the returned slice
 	// immediately after C_Login, so the PIN is not held between logins.
 	ReadPIN func() ([]byte, error)
+	// DeferUnavailable lets OpenPKCS11 return a disconnected source when the
+	// only startup failure is ErrHSMUnavailable (token absent, module cannot
+	// initialise, session cannot open). The first Health/Unwrap call then
+	// reconnects, so a daemon can start before its HSM and use the same
+	// backoff-and-alarm path as a mid-run outage. PIN and configuration
+	// failures are still returned.
+	DeferUnavailable bool
 }
 
 type pkcs11Source struct {
@@ -68,8 +80,9 @@ type pkcs11Source struct {
 }
 
 // OpenPKCS11 initialises the module, logs in, and locates the wrapping key.
-// Every failure is returned: there is deliberately no fallback to software.
-// A rejected PIN wraps ErrPINRejected.
+// Every failure is classified as ErrPINRejected, ErrHSMMisconfigured (both
+// terminal) or ErrHSMUnavailable (retryable). There is deliberately no
+// fallback to software.
 func OpenPKCS11(opts PKCS11Options) (Source, error) {
 	if opts.ModulePath == "" {
 		return nil, fmt.Errorf("pkcs11 module_path is required")
@@ -82,6 +95,9 @@ func OpenPKCS11(opts PKCS11Options) (Source, error) {
 	}
 	s := &pkcs11Source{opts: opts}
 	if err := s.connect(); err != nil {
+		if opts.DeferUnavailable && errors.Is(err, ErrHSMUnavailable) {
+			return s, nil
+		}
 		return nil, err
 	}
 	return s, nil
@@ -93,11 +109,11 @@ func (s *pkcs11Source) connect() error {
 	opts := s.opts
 	ctx := pkcs11.New(opts.ModulePath)
 	if ctx == nil {
-		return fmt.Errorf("failed to load PKCS#11 module %q", opts.ModulePath)
+		return fmt.Errorf("%w: failed to load PKCS#11 module %q", ErrHSMMisconfigured, opts.ModulePath)
 	}
 	if err := ctx.Initialize(); err != nil {
 		ctx.Destroy()
-		return fmt.Errorf("pkcs11 initialize: %w", err)
+		return fmt.Errorf("%w: pkcs11 initialize: %w", ErrHSMUnavailable, err)
 	}
 
 	cleanup := func() {
@@ -108,45 +124,46 @@ func (s *pkcs11Source) connect() error {
 	slots, err := ctx.GetSlotList(true)
 	if err != nil {
 		cleanup()
-		return fmt.Errorf("pkcs11 slot list: %w", err)
+		return fmt.Errorf("%w: pkcs11 slot list: %w", ErrHSMUnavailable, err)
 	}
 	if len(slots) == 0 {
 		cleanup()
-		return fmt.Errorf("no PKCS#11 tokens present")
+		return fmt.Errorf("%w: no PKCS#11 tokens present", ErrHSMUnavailable)
 	}
 
 	slot, err := selectSlot(ctx, slots, opts.TokenLabel)
 	if err != nil {
 		cleanup()
-		return err
+		// The labelled token is not (yet) present: an availability problem.
+		return fmt.Errorf("%w: %w", ErrHSMUnavailable, err)
 	}
 	mechanismInfo, err := ctx.GetMechanismInfo(slot, []*pkcs11.Mechanism{
 		pkcs11.NewMechanism(pkcs11.CKM_AES_GCM, nil),
 	})
 	if err != nil {
 		cleanup()
-		return fmt.Errorf("pkcs11 token does not support CKM_AES_GCM: %w", err)
+		return fmt.Errorf("%w: pkcs11 token does not support CKM_AES_GCM: %w", ErrHSMMisconfigured, err)
 	}
 	if err := validateGCMMechanism(mechanismInfo); err != nil {
 		cleanup()
-		return err
+		return fmt.Errorf("%w: %w", ErrHSMMisconfigured, err)
 	}
 
 	session, err := ctx.OpenSession(slot, pkcs11.CKF_SERIAL_SESSION)
 	if err != nil {
 		cleanup()
-		return fmt.Errorf("pkcs11 open session: %w", err)
+		return fmt.Errorf("%w: pkcs11 open session: %w", ErrHSMUnavailable, err)
 	}
 	pinBytes, err := opts.ReadPIN()
 	if err != nil {
 		_ = ctx.CloseSession(session)
 		cleanup()
-		return fmt.Errorf("read HSM PIN: %w", err)
+		return fmt.Errorf("%w: read HSM PIN: %w", ErrHSMMisconfigured, err)
 	}
 	if len(pinBytes) == 0 {
 		_ = ctx.CloseSession(session)
 		cleanup()
-		return fmt.Errorf("pkcs11 PIN is empty")
+		return fmt.Errorf("%w: pkcs11 PIN is empty", ErrHSMMisconfigured)
 	}
 	// unsafe.String views the PIN bytes without copying, so the wipe below
 	// also erases the memory Login reads from. A plain string(pinBytes)
@@ -165,7 +182,7 @@ func (s *pkcs11Source) connect() error {
 			return fmt.Errorf("%w (%v); not retrying so a hardware token's retry counter is not exhausted",
 				ErrPINRejected, loginErr)
 		}
-		return fmt.Errorf("pkcs11 login failed: %w", loginErr)
+		return fmt.Errorf("%w: pkcs11 login failed: %w", ErrHSMUnavailable, loginErr)
 	}
 
 	key, err := findSecretKey(ctx, session, opts.KeyLabel)
@@ -173,13 +190,15 @@ func (s *pkcs11Source) connect() error {
 		_ = ctx.Logout(session)
 		_ = ctx.CloseSession(session)
 		cleanup()
-		return err
+		// The token is present and logged in, so a missing or ambiguous key
+		// is a provisioning error, not an outage.
+		return fmt.Errorf("%w: %w", ErrHSMMisconfigured, err)
 	}
 	if err := validateSecretKey(ctx, session, key); err != nil {
 		_ = ctx.Logout(session)
 		_ = ctx.CloseSession(session)
 		cleanup()
-		return fmt.Errorf("pkcs11 key %q is unsafe: %w", opts.KeyLabel, err)
+		return fmt.Errorf("%w: pkcs11 key %q is unsafe: %w", ErrHSMMisconfigured, opts.KeyLabel, err)
 	}
 
 	s.ctx, s.session, s.key, s.live = ctx, session, key, true
@@ -215,10 +234,10 @@ func (s *pkcs11Source) ensureLive() error {
 	}
 	s.disconnect()
 	if err := s.connect(); err != nil {
-		if errors.Is(err, ErrPINRejected) {
+		if errors.Is(err, ErrPINRejected) || errors.Is(err, ErrHSMMisconfigured) || errors.Is(err, ErrHSMUnavailable) {
 			return err
 		}
-		return fmt.Errorf("%w: reconnect: %v", ErrHSMUnavailable, err)
+		return fmt.Errorf("%w: %w", ErrHSMUnavailable, err)
 	}
 	return nil
 }

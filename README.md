@@ -190,9 +190,13 @@ sudo systemd-run --pipe --wait --collect -p User=autohsm -p Group=autohsm \
 
 Add the same `-p` properties you put in the drop-in. A wrong PIN exits 78 and is
 never retried, so a mistyped PIN cannot count a hardware token down to lockout.
-If the token or its session goes away while the daemon runs, it raises
-`hsm_unavailable`, reconnects with backoff (up to 5 minutes between attempts), and
-raises `hsm_recovered` when the session is back.
+If the token is absent when the daemon starts, or it or its session goes away
+while the daemon runs, the daemon keeps running: it raises `hsm_unavailable` once,
+reconnects with backoff (up to 5 minutes between attempts), submits nothing
+meanwhile, and raises `hsm_recovered` when the session is back. Failures that
+retrying cannot fix exit 78 and are not restarted: a rejected PIN, an unloadable
+module, a token without AES-GCM, a missing, ambiguous or unsafe key, and any
+configuration error.
 
 During a partial distributed unseal, each daemon records accepted share indexes in
 `/run/autohsm`, keyed to the unseal nonce Vault returned when the share was accepted.
@@ -220,7 +224,7 @@ With `alarm.webhook_url` set, the daemon posts:
 | `vault_unreachable` | every poll that cannot reach Vault |
 | `hsm_unavailable` / `hsm_recovered` | once when the HSM session is lost and cannot be re-opened / when it is back |
 | `shares_stale` | Vault rejected the key material itself (for example shares from before a re-init); the daemon stops submitting until restarted and repeats this alarm with backoff (up to hourly) instead of `vault_sealed` |
-| `autohsm_failed` | just before the daemon exits on an error (PIN rejected, HSM missing at startup, retry budget exhausted, unsafe layout) |
+| `autohsm_failed` | just before the daemon exits on an error (PIN rejected, unusable HSM module or key, configuration error, retry budget exhausted, unsafe layout) |
 
 `status` never opens the HSM. Exiting 2 is the cheapest possible monitor and needs no webhook:
 
