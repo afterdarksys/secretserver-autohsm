@@ -19,6 +19,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -228,10 +229,79 @@ func (c *Client) do(ctx context.Context, method, path string, body []byte, out a
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("%s %s: vault returned %s", method, path, resp.Status)
+		apiErr := &APIError{Method: method, Path: path, StatusCode: resp.StatusCode, Status: resp.Status}
+		var body struct {
+			Errors []string `json:"errors"`
+		}
+		if json.Unmarshal(raw, &body) == nil {
+			for i, m := range body.Errors {
+				if i == maxErrorMessages {
+					break
+				}
+				apiErr.Messages = append(apiErr.Messages, sanitizeMessage(m))
+			}
+		}
+		return apiErr
 	}
 	if err := json.Unmarshal(raw, out); err != nil {
 		return fmt.Errorf("decode response: %w", err)
 	}
 	return nil
+}
+
+const (
+	maxErrorMessages = 4
+	maxErrorLen      = 300
+)
+
+// APIError is a non-2xx reply from Vault. Messages are Vault's own error
+// strings (bounded, control characters removed). Vault's seal and unseal
+// errors describe the failure, never the submitted key.
+type APIError struct {
+	Method     string
+	Path       string
+	StatusCode int
+	Status     string
+	Messages   []string
+}
+
+func (e *APIError) Error() string {
+	msg := fmt.Sprintf("%s %s: vault returned %s", e.Method, e.Path, e.Status)
+	if len(e.Messages) > 0 {
+		msg += ": " + strings.Join(e.Messages, "; ")
+	}
+	return msg
+}
+
+func sanitizeMessage(m string) string {
+	m = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return ' '
+		}
+		return r
+	}, m)
+	if len(m) > maxErrorLen {
+		m = m[:maxErrorLen] + "..."
+	}
+	return m
+}
+
+// IsKeyRejected reports whether Vault rejected unseal key material itself:
+// either a malformed share, or a combined set of shares that does not
+// decrypt this Vault's keyring (for example shares from before a re-init).
+// Vault 1.20 answers the latter with HTTP 400 "unable to retrieve stored keys:
+// invalid key: failed to decrypt keys from storage ... message authentication
+// failed" once the threshold is reached. This is deterministic for a given
+// key set, unlike a network or availability failure.
+func IsKeyRejected(err error) bool {
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusBadRequest {
+		return false
+	}
+	for _, m := range apiErr.Messages {
+		if strings.Contains(m, "invalid key") {
+			return true
+		}
+	}
+	return false
 }

@@ -291,3 +291,50 @@ func TestPinnedPoolDoesNotTrustSystemRoots(t *testing.T) {
 		t.Fatalf("expected a certificate verification error, got: %v", err)
 	}
 }
+
+// The body below is Vault 1.20.4's actual reply when the threshold is reached
+// with shares from a different initialisation (captured locally).
+const staleKeysReply = `{"errors":["unable to retrieve stored keys: invalid key: failed to decrypt keys from storage: error decrypting seal wrapped value\nerror decrypting using seal shamir: cipher: message authentication failed"]}`
+
+func TestIsKeyRejected(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		body   string
+		want   bool
+	}{
+		{"stale key set", http.StatusBadRequest, staleKeysReply, true},
+		{"malformed share", http.StatusBadRequest, `{"errors":["invalid key: key is shorter than minimum 16 bytes"]}`, true},
+		{"uninitialized", http.StatusBadRequest, `{"errors":["Vault is not initialized"]}`, false},
+		{"server error", http.StatusInternalServerError, `{"errors":["invalid key"]}`, false},
+		{"no body", http.StatusBadRequest, ``, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, ca := newTestVault(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tc.status)
+				fmt.Fprint(w, tc.body)
+			}))
+			c, err := New(Config{Address: srv.URL, CACertPath: ca})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = c.SubmitUnsealShare(context.Background(), []byte("secret-share-value"))
+			if err == nil {
+				t.Fatal("non-2xx treated as success")
+			}
+			if got := IsKeyRejected(err); got != tc.want {
+				t.Fatalf("IsKeyRejected=%v, want %v (%v)", got, tc.want, err)
+			}
+			if strings.Contains(err.Error(), "secret-share-value") {
+				t.Fatal("error echoes the submitted share")
+			}
+			if strings.ContainsAny(err.Error(), "\n\r") {
+				t.Fatal("error carries control characters from the response")
+			}
+		})
+	}
+	if IsKeyRejected(errors.New("invalid key")) {
+		t.Fatal("non-API error classified as key rejection")
+	}
+}
