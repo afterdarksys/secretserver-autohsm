@@ -91,7 +91,9 @@ func exitCode(err error) int {
 	if errors.As(err, &sealed) {
 		return exitSealed
 	}
-	if errors.Is(err, watch.ErrTerminal) {
+	// A rejected PIN is terminal: a restart loop would retry C_Login and burn
+	// a hardware token's PIN retry counter.
+	if errors.Is(err, watch.ErrTerminal) || errors.Is(err, keysource.ErrPINRejected) {
 		return exitTerminal
 	}
 	return 1
@@ -172,16 +174,13 @@ func newVaultClient(cfg *config.Config) (*vaultclient.Client, error) {
 func openKeySource(cfg *config.Config) (keysource.Source, error) {
 	switch cfg.Keys.Source {
 	case "pkcs11":
-		pin, err := cfg.Keys.PKCS11.ResolvePIN()
-		if err != nil {
-			return nil, err
-		}
-		defer secure.Wipe(pin)
+		// The PIN is re-read (pin_file) for each login, including a re-login
+		// after a lost session, and wiped by the source right after C_Login.
 		return keysource.OpenPKCS11(keysource.PKCS11Options{
 			ModulePath: cfg.Keys.PKCS11.ModulePath,
 			TokenLabel: cfg.Keys.PKCS11.TokenLabel,
 			KeyLabel:   cfg.Keys.PKCS11.KeyLabel,
-			PIN:        pin,
+			ReadPIN:    cfg.Keys.PKCS11.ResolvePIN,
 		})
 	case "file":
 		// Development only; config.Validate already required the explicit opt-in.

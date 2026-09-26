@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/afterdarksys/secretserver-autohsm/internal/keysource"
 	"github.com/afterdarksys/secretserver-autohsm/internal/watch"
 )
 
@@ -24,6 +25,8 @@ func TestExitCode(t *testing.T) {
 		{"sealed", sealedError{msg: "sealed"}, exitSealed},
 		{"wrapped sealed", fmt.Errorf("status: %w", sealedError{msg: "sealed"}), exitSealed},
 		{"terminal", fmt.Errorf("watch: %w", watch.ErrTerminal), exitTerminal},
+		{"pin rejected", fmt.Errorf("open: %w", keysource.ErrPINRejected), exitTerminal},
+		{"hsm unavailable", fmt.Errorf("open: %w", keysource.ErrHSMUnavailable), 1},
 		{"ordinary", errors.New("network down"), 1},
 	}
 	for _, tt := range tests {

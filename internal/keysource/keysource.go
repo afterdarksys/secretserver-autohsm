@@ -41,6 +41,13 @@ type Source interface {
 	Close() error
 }
 
+// HealthChecker is implemented by sources whose backing device can go away
+// (an HSM). Health re-establishes a lost session when it can and reports
+// whether the source is usable.
+type HealthChecker interface {
+	Health(ctx context.Context) error
+}
+
 // AAD builds the additional authenticated data binding a share to one node and
 // index. Changing node or index changes the AAD, so the AEAD tag check fails.
 // NodeID is a configuration label, not proof that code runs on a physical host.

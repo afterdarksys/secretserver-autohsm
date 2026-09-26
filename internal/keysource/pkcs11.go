@@ -19,10 +19,12 @@ package keysource
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"unsafe"
 
+	"github.com/afterdarksys/secretserver-autohsm/internal/secure"
 	"github.com/miekg/pkcs11"
 )
 
@@ -30,24 +32,44 @@ import (
 // 128 bits is the full GCM tag; shorter tags weaken forgery resistance.
 const gcmTagBits = 128
 
+// ErrPINRejected reports that the token refused the PIN (incorrect, locked,
+// expired, or invalid). It is terminal: the source never logs in again after
+// seeing it, because repeated wrong-PIN attempts count down a hardware token's
+// retry counter and can lock or zeroise it.
+var ErrPINRejected = errors.New("HSM rejected the PIN")
+
+// ErrHSMUnavailable reports that the token or its session is gone (removed,
+// unreachable, session invalidated) and could not be re-established. It is
+// transient: a later call retries the connection.
+var ErrHSMUnavailable = errors.New("HSM unavailable")
+
 // PKCS11Options describes how to reach the token and which key to use.
 type PKCS11Options struct {
 	ModulePath string
 	TokenLabel string // optional; if empty, the first token with the key is used
 	KeyLabel   string
-	PIN        []byte
+	// ReadPIN supplies the user PIN for every login: the initial one and each
+	// re-login after a lost session. The source wipes the returned slice
+	// immediately after C_Login, so the PIN is not held between logins.
+	ReadPIN func() ([]byte, error)
 }
 
 type pkcs11Source struct {
 	mu      sync.Mutex
+	opts    PKCS11Options
 	ctx     *pkcs11.Ctx
 	session pkcs11.SessionHandle
 	key     pkcs11.ObjectHandle
-	closed  bool
+	// live means ctx/session/key are usable; false forces a reconnect.
+	live bool
+	// pinRejected is sticky for the life of the process (see ErrPINRejected).
+	pinRejected bool
+	closed      bool
 }
 
 // OpenPKCS11 initialises the module, logs in, and locates the wrapping key.
-// Every failure is terminal: there is deliberately no fallback to software.
+// Every failure is returned: there is deliberately no fallback to software.
+// A rejected PIN wraps ErrPINRejected.
 func OpenPKCS11(opts PKCS11Options) (Source, error) {
 	if opts.ModulePath == "" {
 		return nil, fmt.Errorf("pkcs11 module_path is required")
@@ -55,17 +77,27 @@ func OpenPKCS11(opts PKCS11Options) (Source, error) {
 	if opts.KeyLabel == "" {
 		return nil, fmt.Errorf("pkcs11 key_label is required")
 	}
-	if len(opts.PIN) == 0 {
-		return nil, fmt.Errorf("pkcs11 PIN is required")
+	if opts.ReadPIN == nil {
+		return nil, fmt.Errorf("pkcs11 PIN source is required")
 	}
+	s := &pkcs11Source{opts: opts}
+	if err := s.connect(); err != nil {
+		return nil, err
+	}
+	return s, nil
+}
 
+// connect performs a full module initialise, login, key lookup and key
+// validation. On any failure nothing is left open.
+func (s *pkcs11Source) connect() error {
+	opts := s.opts
 	ctx := pkcs11.New(opts.ModulePath)
 	if ctx == nil {
-		return nil, fmt.Errorf("failed to load PKCS#11 module %q", opts.ModulePath)
+		return fmt.Errorf("failed to load PKCS#11 module %q", opts.ModulePath)
 	}
 	if err := ctx.Initialize(); err != nil {
 		ctx.Destroy()
-		return nil, fmt.Errorf("pkcs11 initialize: %w", err)
+		return fmt.Errorf("pkcs11 initialize: %w", err)
 	}
 
 	cleanup := func() {
@@ -76,48 +108,64 @@ func OpenPKCS11(opts PKCS11Options) (Source, error) {
 	slots, err := ctx.GetSlotList(true)
 	if err != nil {
 		cleanup()
-		return nil, fmt.Errorf("pkcs11 slot list: %w", err)
+		return fmt.Errorf("pkcs11 slot list: %w", err)
 	}
 	if len(slots) == 0 {
 		cleanup()
-		return nil, fmt.Errorf("no PKCS#11 tokens present")
+		return fmt.Errorf("no PKCS#11 tokens present")
 	}
 
 	slot, err := selectSlot(ctx, slots, opts.TokenLabel)
 	if err != nil {
 		cleanup()
-		return nil, err
+		return err
 	}
 	mechanismInfo, err := ctx.GetMechanismInfo(slot, []*pkcs11.Mechanism{
 		pkcs11.NewMechanism(pkcs11.CKM_AES_GCM, nil),
 	})
 	if err != nil {
 		cleanup()
-		return nil, fmt.Errorf("pkcs11 token does not support CKM_AES_GCM: %w", err)
+		return fmt.Errorf("pkcs11 token does not support CKM_AES_GCM: %w", err)
 	}
 	if err := validateGCMMechanism(mechanismInfo); err != nil {
 		cleanup()
-		return nil, err
+		return err
 	}
 
 	session, err := ctx.OpenSession(slot, pkcs11.CKF_SERIAL_SESSION)
 	if err != nil {
 		cleanup()
-		return nil, fmt.Errorf("pkcs11 open session: %w", err)
+		return fmt.Errorf("pkcs11 open session: %w", err)
 	}
-	// unsafe.String views opts.PIN without copying, so the caller's deferred
-	// wipe of that slice also erases the memory Login reads from. A plain
-	// string(opts.PIN) conversion instead deep-copies into a second,
-	// unwipeable allocation that lingers until the GC reclaims it on its own
-	// schedule -- exactly the kind of copy secure.Wipe's contract warns
-	// against. opts.PIN is guaranteed non-empty by the check above, so
-	// SliceData is never nil here.
-	pin := unsafe.String(unsafe.SliceData(opts.PIN), len(opts.PIN))
-	if err := ctx.Login(session, pkcs11.CKU_USER, pin); err != nil {
+	pinBytes, err := opts.ReadPIN()
+	if err != nil {
+		_ = ctx.CloseSession(session)
+		cleanup()
+		return fmt.Errorf("read HSM PIN: %w", err)
+	}
+	if len(pinBytes) == 0 {
+		_ = ctx.CloseSession(session)
+		cleanup()
+		return fmt.Errorf("pkcs11 PIN is empty")
+	}
+	// unsafe.String views the PIN bytes without copying, so the wipe below
+	// also erases the memory Login reads from. A plain string(pinBytes)
+	// conversion would deep-copy into an unwipeable Go allocation. (The
+	// library's own C copy for the call is freed without zeroing; see
+	// VALIDATION.md.)
+	pin := unsafe.String(unsafe.SliceData(pinBytes), len(pinBytes))
+	loginErr := ctx.Login(session, pkcs11.CKU_USER, pin)
+	secure.Wipe(pinBytes)
+	if loginErr != nil {
 		_ = ctx.CloseSession(session)
 		cleanup()
 		// The PIN itself is never included in the error.
-		return nil, fmt.Errorf("pkcs11 login failed: %w", err)
+		if isPINError(loginErr) {
+			s.pinRejected = true
+			return fmt.Errorf("%w (%v); not retrying so a hardware token's retry counter is not exhausted",
+				ErrPINRejected, loginErr)
+		}
+		return fmt.Errorf("pkcs11 login failed: %w", loginErr)
 	}
 
 	key, err := findSecretKey(ctx, session, opts.KeyLabel)
@@ -125,16 +173,87 @@ func OpenPKCS11(opts PKCS11Options) (Source, error) {
 		_ = ctx.Logout(session)
 		_ = ctx.CloseSession(session)
 		cleanup()
-		return nil, err
+		return err
 	}
 	if err := validateSecretKey(ctx, session, key); err != nil {
 		_ = ctx.Logout(session)
 		_ = ctx.CloseSession(session)
 		cleanup()
-		return nil, fmt.Errorf("pkcs11 key %q is unsafe: %w", opts.KeyLabel, err)
+		return fmt.Errorf("pkcs11 key %q is unsafe: %w", opts.KeyLabel, err)
 	}
 
-	return &pkcs11Source{ctx: ctx, session: session, key: key}, nil
+	s.ctx, s.session, s.key, s.live = ctx, session, key, true
+	return nil
+}
+
+// disconnect tears down whatever is open; errors are irrelevant because the
+// handles are being abandoned either way.
+func (s *pkcs11Source) disconnect() {
+	if s.ctx == nil {
+		return
+	}
+	_ = s.ctx.Logout(s.session)
+	_ = s.ctx.CloseSession(s.session)
+	_ = s.ctx.Finalize()
+	s.ctx.Destroy()
+	s.ctx = nil
+	s.live = false
+}
+
+// ensureLive reconnects when the session was lost. A rejected PIN is sticky
+// and never retried; any other reconnect failure wraps ErrHSMUnavailable.
+// Callers must hold s.mu.
+func (s *pkcs11Source) ensureLive() error {
+	if s.closed {
+		return fmt.Errorf("pkcs11 source is closed")
+	}
+	if s.pinRejected {
+		return fmt.Errorf("%w earlier in this process; restart after fixing the PIN", ErrPINRejected)
+	}
+	if s.live {
+		return nil
+	}
+	s.disconnect()
+	if err := s.connect(); err != nil {
+		if errors.Is(err, ErrPINRejected) {
+			return err
+		}
+		return fmt.Errorf("%w: reconnect: %v", ErrHSMUnavailable, err)
+	}
+	return nil
+}
+
+// isSessionLoss reports PKCS#11 errors meaning the session, login, key handle
+// or device went away, as opposed to a bad ciphertext or AAD.
+func isSessionLoss(err error) bool {
+	var e pkcs11.Error
+	if !errors.As(err, &e) {
+		return false
+	}
+	switch uint(e) {
+	case pkcs11.CKR_SESSION_HANDLE_INVALID, pkcs11.CKR_SESSION_CLOSED,
+		pkcs11.CKR_DEVICE_REMOVED, pkcs11.CKR_DEVICE_ERROR,
+		pkcs11.CKR_TOKEN_NOT_PRESENT, pkcs11.CKR_TOKEN_NOT_RECOGNIZED,
+		pkcs11.CKR_USER_NOT_LOGGED_IN, pkcs11.CKR_CRYPTOKI_NOT_INITIALIZED,
+		pkcs11.CKR_KEY_HANDLE_INVALID, pkcs11.CKR_OBJECT_HANDLE_INVALID:
+		return true
+	}
+	return false
+}
+
+// isPINError reports login failures caused by the PIN itself. Retrying these
+// burns the token's retry counter.
+func isPINError(err error) bool {
+	var e pkcs11.Error
+	if !errors.As(err, &e) {
+		return false
+	}
+	switch uint(e) {
+	case pkcs11.CKR_PIN_INCORRECT, pkcs11.CKR_PIN_LOCKED, pkcs11.CKR_PIN_EXPIRED,
+		pkcs11.CKR_PIN_INVALID, pkcs11.CKR_PIN_LEN_RANGE:
+		return true
+	}
+	return false
 }
 
 func validateGCMMechanism(info pkcs11.MechanismInfo) error {
@@ -243,7 +362,9 @@ func findSecretKey(ctx *pkcs11.Ctx, session pkcs11.SessionHandle, label string) 
 }
 
 // Unwrap decrypts the envelope inside the token. Plaintext exists in this
-// process only after the token authenticates the ciphertext and AAD.
+// process only after the token authenticates the ciphertext and AAD. A lost
+// session is re-established once (re-login included) before giving up with
+// ErrHSMUnavailable.
 func (s *pkcs11Source) Unwrap(_ context.Context, blob []byte, aad []byte) ([]byte, error) {
 	env, err := ParseEnvelope(blob)
 	if err != nil {
@@ -252,18 +373,21 @@ func (s *pkcs11Source) Unwrap(_ context.Context, blob []byte, aad []byte) ([]byt
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed {
-		return nil, fmt.Errorf("pkcs11 source is closed")
+	if err := s.ensureLive(); err != nil {
+		return nil, err
 	}
-
-	params := pkcs11.NewGCMParams(env.Nonce, aad, gcmTagBits)
-	defer params.Free()
-
-	mech := []*pkcs11.Mechanism{pkcs11.NewMechanism(pkcs11.CKM_AES_GCM, params)}
-	if err := s.ctx.DecryptInit(s.session, mech, s.key); err != nil {
-		return nil, fmt.Errorf("pkcs11 decrypt init (does the token support CKM_AES_GCM?): %w", err)
+	plain, err := s.decrypt(env, aad)
+	if err != nil && isSessionLoss(err) {
+		s.live = false
+		if rerr := s.ensureLive(); rerr != nil {
+			return nil, rerr
+		}
+		plain, err = s.decrypt(env, aad)
+		if err != nil && isSessionLoss(err) {
+			s.live = false
+			return nil, fmt.Errorf("%w: %v", ErrHSMUnavailable, err)
+		}
 	}
-	plain, err := s.ctx.Decrypt(s.session, env.Ciphertext)
 	if err != nil {
 		// Opaque on purpose: do not distinguish wrong-key from wrong-AAD.
 		return nil, fmt.Errorf("unwrap failed: share is not authentic for this node and index")
@@ -274,12 +398,39 @@ func (s *pkcs11Source) Unwrap(_ context.Context, blob []byte, aad []byte) ([]byt
 	return plain, nil
 }
 
+func (s *pkcs11Source) decrypt(env Envelope, aad []byte) ([]byte, error) {
+	params := pkcs11.NewGCMParams(env.Nonce, aad, gcmTagBits)
+	defer params.Free()
+	mech := []*pkcs11.Mechanism{pkcs11.NewMechanism(pkcs11.CKM_AES_GCM, params)}
+	if err := s.ctx.DecryptInit(s.session, mech, s.key); err != nil {
+		return nil, err
+	}
+	return s.ctx.Decrypt(s.session, env.Ciphertext)
+}
+
+// Health verifies the session is still open and logged in, reconnecting if
+// it is not. It returns nil, an ErrPINRejected error (terminal), or an
+// ErrHSMUnavailable error (retry later).
+func (s *pkcs11Source) Health(context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.ensureLive(); err != nil {
+		return err
+	}
+	info, err := s.ctx.GetSessionInfo(s.session)
+	if err == nil && (info.State == pkcs11.CKS_RO_USER_FUNCTIONS || info.State == pkcs11.CKS_RW_USER_FUNCTIONS) {
+		return nil
+	}
+	s.live = false
+	return s.ensureLive()
+}
+
 // WrapPKCS11 encrypts plaintext inside the token, for provisioning.
 func (s *pkcs11Source) wrap(nonce, plaintext, aad []byte) ([]byte, []byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.closed {
-		return nil, nil, fmt.Errorf("pkcs11 source is closed")
+	if err := s.ensureLive(); err != nil {
+		return nil, nil, err
 	}
 	params := pkcs11.NewGCMParams(nonce, aad, gcmTagBits)
 	defer params.Free()
@@ -326,10 +477,7 @@ func (s *pkcs11Source) Close() error {
 		return nil
 	}
 	s.closed = true
-	_ = s.ctx.Logout(s.session)
-	_ = s.ctx.CloseSession(s.session)
-	_ = s.ctx.Finalize()
-	s.ctx.Destroy()
+	s.disconnect()
 	return nil
 }
 

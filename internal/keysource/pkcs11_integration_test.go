@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -107,12 +108,18 @@ slots.mechanisms = ALL
 	_ = ctx.Finalize()
 	ctx.Destroy()
 
+	var pinReads int
+	currentPIN := userPIN
+	readPIN := func() ([]byte, error) {
+		pinReads++
+		return []byte(currentPIN), nil
+	}
 	open := func(label string) (Source, error) {
 		return OpenPKCS11(PKCS11Options{
 			ModulePath: module,
 			TokenLabel: tokenLabel,
 			KeyLabel:   label,
-			PIN:        []byte(userPIN),
+			ReadPIN:    readPIN,
 		})
 	}
 	src, err := open(safeLabel)
@@ -151,9 +158,86 @@ slots.mechanisms = ALL
 	if _, err := src.Unwrap(context.Background(), []byte(MarshalEnvelope(parsed)), aad); err == nil {
 		t.Fatal("SoftHSM accepted tampered ciphertext")
 	}
+
+	// --- Session recovery: invalidate the live session behind the source's
+	// back (as an HSM reset or network drop would) and prove it re-opens and
+	// re-logs in on the next use.
+	p := src.(*pkcs11Source)
+	info, err := p.ctx.GetSessionInfo(p.session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.ctx.CloseAllSessions(info.SlotID); err != nil {
+		t.Fatal(err)
+	}
+	readsBefore := pinReads
+	got, err = src.Unwrap(context.Background(), []byte(envelope), aad)
+	if err != nil {
+		t.Fatalf("unwrap after invalidated session: %v", err)
+	}
+	if !bytes.Equal(got, plaintext) || pinReads != readsBefore+1 {
+		t.Fatalf("recovery: got %q, PIN reads %d (want %d)", got, pinReads, readsBefore+1)
+	}
+	if err := p.ctx.CloseAllSessions(info.SlotID); err != nil {
+		t.Fatal(err)
+	}
+	if err := src.(HealthChecker).Health(context.Background()); err != nil {
+		t.Fatalf("health did not recover an invalidated session: %v", err)
+	}
+
+	// --- Token gone: reconnect fails as ErrHSMUnavailable (retryable), and
+	// succeeds once the token is back.
+	if err := os.Rename(tokenDir, tokenDir+".gone"); err != nil {
+		t.Fatal(err)
+	}
+	p.mu.Lock()
+	p.live = false
+	p.mu.Unlock()
+	if err := src.(HealthChecker).Health(context.Background()); !errors.Is(err, ErrHSMUnavailable) {
+		t.Fatalf("missing token: health = %v, want ErrHSMUnavailable", err)
+	}
+	if _, err := src.Unwrap(context.Background(), []byte(envelope), aad); !errors.Is(err, ErrHSMUnavailable) {
+		t.Fatalf("missing token: unwrap = %v, want ErrHSMUnavailable", err)
+	}
+	if err := os.Rename(tokenDir+".gone", tokenDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := src.(HealthChecker).Health(context.Background()); err != nil {
+		t.Fatalf("token restored: health = %v", err)
+	}
+
+	// --- Wrong PIN on re-login: terminal and never retried.
+	currentPIN = "000000"
+	info, err = p.ctx.GetSessionInfo(p.session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.ctx.CloseAllSessions(info.SlotID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := src.Unwrap(context.Background(), []byte(envelope), aad); !errors.Is(err, ErrPINRejected) {
+		t.Fatalf("wrong PIN on re-login: %v, want ErrPINRejected", err)
+	}
+	readsBefore = pinReads
+	for i := 0; i < 3; i++ {
+		_, _ = src.Unwrap(context.Background(), []byte(envelope), aad)
+		_ = src.(HealthChecker).Health(context.Background())
+	}
+	if pinReads != readsBefore {
+		t.Fatalf("PIN retried %d times after rejection", pinReads-readsBefore)
+	}
 	if err := src.Close(); err != nil {
 		t.Fatal(err)
 	}
+
+	// Wrong PIN at startup is ErrPINRejected too.
+	if s, err := open(safeLabel); !errors.Is(err, ErrPINRejected) {
+		if s != nil {
+			s.Close()
+		}
+		t.Fatalf("startup with wrong PIN: %v, want ErrPINRejected", err)
+	}
+	currentPIN = userPIN
 
 	if unsafe, err := open(badLabel); err == nil {
 		unsafe.Close()

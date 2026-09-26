@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
@@ -243,5 +245,55 @@ func TestWrapUsesFreshNonce(t *testing.T) {
 			t.Fatal("nonce reused across wraps")
 		}
 		seen[n] = true
+	}
+}
+
+func TestPKCS11ErrorClassification(t *testing.T) {
+	for _, code := range []uint{pkcs11.CKR_PIN_INCORRECT, pkcs11.CKR_PIN_LOCKED, pkcs11.CKR_PIN_EXPIRED, pkcs11.CKR_PIN_INVALID, pkcs11.CKR_PIN_LEN_RANGE} {
+		err := fmt.Errorf("login: %w", pkcs11.Error(code))
+		if !isPINError(err) || isSessionLoss(err) {
+			t.Errorf("0x%x must be a PIN error only", code)
+		}
+	}
+	for _, code := range []uint{pkcs11.CKR_SESSION_HANDLE_INVALID, pkcs11.CKR_SESSION_CLOSED, pkcs11.CKR_DEVICE_REMOVED, pkcs11.CKR_TOKEN_NOT_PRESENT, pkcs11.CKR_USER_NOT_LOGGED_IN} {
+		if !isSessionLoss(pkcs11.Error(code)) || isPINError(pkcs11.Error(code)) {
+			t.Errorf("0x%x must be a session loss only", code)
+		}
+	}
+	// A bad tag must never look like a lost session: that would turn a
+	// tampered share into an endless "HSM unavailable" retry.
+	for _, code := range []uint{pkcs11.CKR_ENCRYPTED_DATA_INVALID, pkcs11.CKR_GENERAL_ERROR, pkcs11.CKR_FUNCTION_FAILED} {
+		if isSessionLoss(pkcs11.Error(code)) || isPINError(pkcs11.Error(code)) {
+			t.Errorf("0x%x misclassified", code)
+		}
+	}
+	if isSessionLoss(errors.New("plain")) || isPINError(errors.New("plain")) {
+		t.Error("non-PKCS#11 error misclassified")
+	}
+}
+
+// Negative: once the token rejected the PIN, the source must never log in
+// again (no ReadPIN, no C_Login) for the rest of the process.
+func TestPINRejectionIsSticky(t *testing.T) {
+	reads := 0
+	s := &pkcs11Source{pinRejected: true, opts: PKCS11Options{ReadPIN: func() ([]byte, error) {
+		reads++
+		return []byte("1234"), nil
+	}}}
+	blob := MarshalEnvelope(Envelope{Nonce: make([]byte, gcmNonceLen), Ciphertext: make([]byte, gcmTagLen+1)})
+	if _, err := s.Unwrap(context.Background(), []byte(blob), AAD("n", 1)); !errors.Is(err, ErrPINRejected) {
+		t.Fatalf("Unwrap after PIN rejection: %v", err)
+	}
+	if err := s.Health(context.Background()); !errors.Is(err, ErrPINRejected) {
+		t.Fatalf("Health after PIN rejection: %v", err)
+	}
+	if reads != 0 {
+		t.Fatalf("PIN read %d times after rejection, want 0", reads)
+	}
+}
+
+func TestOpenPKCS11RequiresPINSource(t *testing.T) {
+	if _, err := OpenPKCS11(PKCS11Options{ModulePath: "/nonexistent.so", KeyLabel: "k"}); err == nil {
+		t.Fatal("OpenPKCS11 accepted a missing PIN source")
 	}
 }
