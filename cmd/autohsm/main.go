@@ -391,7 +391,9 @@ func runWrap(cfgPath string, args []string) error {
 }
 
 func readShare(r io.Reader) ([]byte, error) {
-	raw, err := io.ReadAll(io.LimitReader(r, maxShareSize+3))
+	// Bounded single-buffer read (see config.ReadBounded): no reallocation
+	// copies of the plaintext share are left behind in the heap.
+	raw, err := config.ReadBounded(r, maxShareSize+2)
 	if err != nil {
 		return nil, fmt.Errorf("read share from stdin: %w", err)
 	}

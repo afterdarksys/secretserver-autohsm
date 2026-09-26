@@ -199,17 +199,21 @@ func validateSecretFileMetadata(mode os.FileMode, ownerUID uint32) error {
 }
 
 // ReadBounded reads at most limit bytes from r, refusing (and wiping the
-// partial read) if the source has more.
+// partial read) if the source has more. It reads into ONE buffer allocated up
+// front: io.ReadAll grows by reallocating, which would leave earlier partial
+// copies of a PIN or share in freed heap memory that can never be wiped.
 func ReadBounded(r io.Reader, limit int64) ([]byte, error) {
-	b, err := io.ReadAll(io.LimitReader(r, limit+1))
-	if err != nil {
+	buf := make([]byte, limit+1)
+	n, err := io.ReadFull(r, buf)
+	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+		wipe(buf)
 		return nil, err
 	}
-	if int64(len(b)) > limit {
-		wipe(b)
+	if int64(n) > limit {
+		wipe(buf)
 		return nil, fmt.Errorf("file exceeds %d bytes", limit)
 	}
-	return b, nil
+	return buf[:n], nil
 }
 
 func wipe(b []byte) {

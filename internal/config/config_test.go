@@ -6,6 +6,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"testing/iotest"
 	"time"
 )
 
@@ -273,5 +274,28 @@ func TestResolvePINRejectsEmptyFile(t *testing.T) {
 	}
 	if _, err := (PKCS11Config{PINFile: p}).ResolvePIN(); err == nil {
 		t.Fatal("empty PIN file accepted")
+	}
+}
+
+// Secret material must be read into a single buffer: every reallocation
+// io.ReadAll would make leaves an unwipeable partial copy in freed memory.
+func TestReadBoundedUsesOneBufferAndRejectsOversize(t *testing.T) {
+	data := strings.Repeat("p", 4000)
+	allocs := testing.AllocsPerRun(20, func() {
+		b, err := ReadBounded(iotest.OneByteReader(strings.NewReader(data)), maxPINSize)
+		if err != nil || len(b) != len(data) {
+			t.Fatalf("ReadBounded: %v (%d bytes)", err, len(b))
+		}
+	})
+	// One for the buffer; the rest are the reader wrappers built per run.
+	if allocs > 3 {
+		t.Fatalf("ReadBounded made %.0f allocations; want a single buffer", allocs)
+	}
+	if _, err := ReadBounded(strings.NewReader(strings.Repeat("x", 11)), 10); err == nil {
+		t.Fatal("oversized input accepted")
+	}
+	b, err := ReadBounded(strings.NewReader("exact-ten!"), 10)
+	if err != nil || string(b) != "exact-ten!" {
+		t.Fatalf("exact-limit read: %q %v", b, err)
 	}
 }
