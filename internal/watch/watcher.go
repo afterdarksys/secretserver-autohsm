@@ -94,9 +94,10 @@ type Watcher struct {
 
 	// consecutiveFailures latches toward MaxUnsealAttempts; reset on success.
 	consecutiveFailures int
-	// submitted tracks shares accepted during the current sealed episode. Vault's
-	// unseal operation is stateful, so resubmitting them on every poll can poison
-	// a distributed unseal with duplicate shares.
+	// submitted tracks shares accepted during the current unseal attempt. Vault
+	// ignores a duplicate part within an attempt, so resubmitting is harmless to
+	// Vault; the latch exists so a waiting node does not re-unwrap through the
+	// HSM, re-send key material, and log a submission on every poll.
 	submitted map[int]bool
 	// submittedNonce is Vault's unseal nonce at the time submitted was last
 	// updated. It identifies which sealed episode the latch belongs to.
@@ -281,11 +282,12 @@ func (w *Watcher) submitShares(ctx context.Context) error {
 			if err := w.removeSubmittedState(); err != nil {
 				w.log.Warn("could not clear submission state", "error", err)
 			}
-			w.log.Info("submitted unseal share; vault unsealed",
+			// Neutral wording: a peer may have completed the unseal first, in
+			// which case Vault answers any submission with sealed=false.
+			w.log.Info("submitted unseal share; vault reports unsealed",
 				"index", sh.Index, "share_fp", fingerprint.Of(blob))
 			return nil
 		}
-		w.submitted[sh.Index] = true
 		// Record the episode nonce Vault returned for THIS submission. The
 		// seal-status nonce observed before submitting is empty for the first
 		// share of an attempt, and a latch keyed to "" can never be recognised
@@ -294,6 +296,12 @@ func (w *Watcher) submitShares(ctx context.Context) error {
 			w.log.Warn("vault returned a malformed unseal nonce; ignoring it")
 			st.Nonce = ""
 		}
+		if st.Nonce != w.submittedNonce {
+			// A different nonce means a new attempt began (Vault restart or
+			// reset) since our earlier submissions; they are not part of it.
+			clear(w.submitted)
+		}
+		w.submitted[sh.Index] = true
 		w.submittedNonce = st.Nonce
 		if err := w.persistSubmittedState(); err != nil {
 			return fmt.Errorf("%w: persist accepted share %d: %v", ErrTerminal, sh.Index, err)

@@ -351,6 +351,87 @@ func TestNoncelessLatchIsStaleWhenVaultReportsNonce(t *testing.T) {
 	}
 }
 
+// vaultish mirrors real Vault unseal semantics: empty nonce at progress 0, a
+// fresh nonce minted on the first part of an attempt, duplicate parts ignored,
+// and the attempt discarded once the threshold is reached.
+type vaultish struct {
+	mu       sync.Mutex
+	parts    []string
+	nonce    string
+	minted   int
+	sealed   bool
+	calls    int
+	onSubmit func(call int)
+}
+
+func (v *vaultish) SealStatus(context.Context) (*vaultclient.SealStatus, error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return &vaultclient.SealStatus{Sealed: v.sealed, Initialized: true, Threshold: 3, Shares: 5, Progress: len(v.parts), Nonce: v.nonce}, nil
+}
+
+func (v *vaultish) addPart(k string) *vaultclient.SealStatus {
+	for _, p := range v.parts {
+		if p == k {
+			return &vaultclient.SealStatus{Sealed: true, Initialized: true, Threshold: 3, Progress: len(v.parts), Nonce: v.nonce}
+		}
+	}
+	if v.nonce == "" {
+		v.minted++
+		v.nonce = fmt.Sprintf("N%d", v.minted)
+	}
+	v.parts = append(v.parts, k)
+	if len(v.parts) >= 3 {
+		v.sealed, v.parts, v.nonce = false, nil, ""
+	}
+	return &vaultclient.SealStatus{Sealed: v.sealed, Initialized: true, Threshold: 3, Progress: len(v.parts), Nonce: v.nonce}
+}
+
+func (v *vaultish) SubmitUnsealShare(_ context.Context, share []byte) (*vaultclient.SealStatus, error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	st := v.addPart(string(share))
+	v.calls++
+	if v.onSubmit != nil {
+		v.onSubmit(v.calls)
+	}
+	return st, nil
+}
+
+// Regression (independent review): a node holding two shares whose Vault
+// restarts between its two submissions must not carry the first share's
+// index into the new attempt's latch. Before the fix the latch became {1,2}
+// under the new nonce although that attempt only received share 2, and the
+// unseal stalled at 2/3.
+func TestLatchDropsIndexesFromEarlierAttemptMidPass(t *testing.T) {
+	src, p1 := setup(t, "apps2", 1, "share-one")
+	_, p2 := setup(t, "apps2", 2, "share-two")
+	v := &vaultish{sealed: true}
+	v.onSubmit = func(call int) {
+		if call == 1 { // Vault restarts right after accepting share 1
+			v.parts, v.nonce = nil, ""
+		}
+	}
+	w := New(v, src, Options{
+		NodeID: "apps2", Shares: []Share{{Index: 1, Path: p1}, {Index: 2, Path: p2}},
+		StatePath: filepath.Join(t.TempDir(), "submitted"), Logger: quietLogger(),
+	})
+	if err := w.Tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	v.mu.Lock()
+	v.addPart("share-three") // a peer contributes to the new attempt
+	v.mu.Unlock()
+	for i := 0; i < 3; i++ {
+		if err := w.Tick(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if st, _ := v.SealStatus(context.Background()); st.Sealed {
+		t.Fatalf("stalled sealed at %d/3; latch=%v@%s", st.Progress, w.submitted, w.submittedNonce)
+	}
+}
+
 // Negative: an unsealed Vault must never receive shares.
 func TestDoesNothingWhenUnsealed(t *testing.T) {
 	src, path := setup(t, "apps2", 1, "share-one")
