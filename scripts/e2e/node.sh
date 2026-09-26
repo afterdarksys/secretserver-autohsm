@@ -134,8 +134,10 @@ watch-stop)
   ;;
 watch-fg) # watch-fg <config>: run the daemon until it exits on its own; print its exit code
   set +e
-  timeout 15 autohsm watch --config "$2" >>/var/log/autohsm-negative.log 2>&1
-  echo "exit=$?"
+  timeout 15 autohsm watch --config "$2" >/tmp/last-negative.log 2>&1
+  rc=$?
+  cat /tmp/last-negative.log >>/var/log/autohsm-negative.log
+  echo "exit=$rc"
   ;;
 mkbad) # mkbad <case> <node_id> <index>: build a negative-case config under /etc/autohsm/bad
   case_=$2 node=$3 idx=$4
@@ -155,7 +157,7 @@ mkbad) # mkbad <case> <node_id> <index>: build a negative-case config under /etc
     share=$d/share.wrapped
     ;;
   foreign-share) share=/e2e/foreign-share.wrapped ; cfg_idx=$5 ;;
-  wrong-pin) printf '000000' >"$d/pin"; pin=$d/pin ;;
+  wrong-pin) printf '000000' >"$d/pin"; chmod 0600 "$d/pin"; pin=$d/pin ;;
   rogue-ca) ca=/e2e/pki/rogue-ca.pem ;;
   missing-token) ;; # config unchanged; the token directory is removed by the caller
   unsafe-layout)

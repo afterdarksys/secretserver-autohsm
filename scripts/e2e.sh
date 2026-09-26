@@ -137,30 +137,33 @@ fi
 sleep 2
 
 echo "== NEGATIVE cases: each must refuse, submit nothing, and leave vault sealed"
-negative() { # negative <label> <node> <config> <want-exit>
-  local label=$1 node=$2 cfg=$3 want=$4 out
+negative() { # negative <label> <node> <config> <want-exit> <expected reason in daemon log>
+  local label=$1 node=$2 cfg=$3 want=$4 reason=$5 out
   on n1 seal >/dev/null 2>&1 || true
   on n1 unseal-reset >/dev/null
   wait_for 10 '.sealed == true and .progress == 0' || { fail "$label: could not reach sealed baseline"; return; }
   if on "$node" selftest "$cfg" >/dev/null 2>&1; then fail "$label: selftest accepted it"; else pass "$label: selftest refuses"; fi
   out=$(on "$node" watch-fg "$cfg")
   [ "$out" = "exit=$want" ] && pass "$label: watch daemon stops fail-closed ($out)" || fail "$label: watch $out, want exit=$want"
+  # Refusing for the wrong reason (e.g. a harness file-mode slip) proves nothing.
+  if docker exec "$PFX-$node" grep -qF -- "$reason" /tmp/last-negative.log; then pass "$label: refused for the intended reason"
+  else fail "$label: expected '$reason' in daemon log"; docker exec "$PFX-$node" tail -3 /tmp/last-negative.log; fi
   if status | jq -e '.sealed == true and .progress == 0' >/dev/null; then
     pass "$label: vault still sealed, no share accepted"
   else fail "$label: vault state $(status)"; fi
 }
-negative "wrong node identity" n3 "$(on n3 mkbad wrong-node n3 3)" 78
-negative "replayed under another index" n3 "$(on n3 mkbad replayed-index n3 3)" 78
-negative "tampered wrapped blob" n3 "$(on n3 mkbad tampered n3 3)" 78
+negative "wrong node identity" n3 "$(on n3 mkbad wrong-node n3 3)" 78 "not authentic for this node and index"
+negative "replayed under another index" n3 "$(on n3 mkbad replayed-index n3 3)" 78 "not authentic for this node and index"
+negative "tampered wrapped blob" n3 "$(on n3 mkbad tampered n3 3)" 78 "not authentic for this node and index"
 docker exec "$PFX-n3" cat /etc/autohsm/share-3.wrapped | docker exec -i "$PFX-n1" sh -c 'cat >/e2e/foreign-share.wrapped'
-negative "share copied from another node's HSM" n1 "$(on n1 mkbad foreign-share n3 3 3)" 78
-negative "wrong HSM PIN" n3 "$(on n3 mkbad wrong-pin n3 3)" 1
-negative "vault cert from an untrusted CA" n3 "$(on n3 mkbad rogue-ca n3 3)" 124
-negative "node holds >= threshold shares" n3 "$(on n3 mkbad unsafe-layout n3 3)" 78
+negative "share copied from another node's HSM" n1 "$(on n1 mkbad foreign-share n3 3 3)" 78 "not authentic for this node and index"
+negative "wrong HSM PIN (terminal, never retried)" n3 "$(on n3 mkbad wrong-pin n3 3)" 78 "HSM rejected the PIN"
+negative "vault cert from an untrusted CA" n3 "$(on n3 mkbad rogue-ca n3 3)" 124 "certificate signed by unknown authority"
+negative "node holds >= threshold shares" n3 "$(on n3 mkbad unsafe-layout n3 3)" 78 "meeting Vault's threshold"
 cfg=$(on n3 mkbad missing-token n3 3)
 docker exec "$PFX-n3" mv /var/lib/softhsm/tokens /var/lib/softhsm/tokens.gone
 docker exec "$PFX-n3" install -d -m 0700 /var/lib/softhsm/tokens
-negative "HSM token missing" n3 "$cfg" 1
+negative "HSM token missing" n3 "$cfg" 1 "no token with label"
 docker exec "$PFX-n3" sh -c 'rm -rf /var/lib/softhsm/tokens && mv /var/lib/softhsm/tokens.gone /var/lib/softhsm/tokens'
 
 echo "== NEGATIVE: two good nodes + one bad node cannot reach threshold"
@@ -174,13 +177,37 @@ if status | jq -e '.sealed == true and .progress == 2' >/dev/null; then
 else fail "partial unseal state $(status)"; fi
 for n in n1 n2; do on "$n" watch-stop; done
 
+echo "== NEGATIVE: vault re-initialised -> shares are stale; fail closed with one shares_stale alarm"
+# Destroy the disposable Vault's storage and initialise it again: every
+# wrapped share now belongs to a Vault that no longer exists.
+docker exec "$PFX-n1" cp /e2e/secret/init.json /e2e/secret/init-1.json
+docker exec "$PFX-vault" sh -c 'rm -rf /vault/file/*'
+docker restart "$PFX-vault" >/dev/null
+wait_for 90 '.initialized == false' || fail "vault did not come back uninitialised"
+on n1 init-vault >/dev/null
+docker exec "$PFX-alarms" sh -c 'cat /e2e/alarms.jsonl >> /e2e/alarms-earlier.jsonl && : > /e2e/alarms.jsonl'
+for n in "${NODES[@]}"; do on "$n" watch-bg; done
+sleep 25
+for n in "${NODES[@]}"; do on "$n" watch-stop; done
+stale_alarms=$(docker exec "$PFX-alarms" grep -c '"event":"shares_stale"' /e2e/alarms.jsonl || true)
+stale_nodes=$(docker exec "$PFX-alarms" sh -c "grep '\"event\":\"shares_stale\"' /e2e/alarms.jsonl | jq -r .node_id | sort -u | wc -l" | tr -d ' ')
+[ "${stale_alarms:-0}" -ge 1 ] && pass "shares_stale alarm raised when vault rejected the old key set"   || fail "no shares_stale alarm"
+# 25 s at a 1 s poll: an alarm every poll would be ~25; backoff allows 1+log2(25) ≈ 5 per node.
+[ "${stale_alarms:-0}" -le $((stale_nodes * 6)) ] && pass "shares_stale deduplicated with backoff ($stale_alarms alarms from $stale_nodes node(s) in 25 s)"   || fail "shares_stale not deduplicated ($stale_alarms alarms)"
+status | jq -e '.sealed == true and .progress < 3' >/dev/null && pass "re-initialised vault stays sealed" || fail "vault state $(status)"
+stale_node=$(docker exec "$PFX-alarms" sh -c "grep '\"event\":\"shares_stale\"' /e2e/alarms.jsonl | head -1 | jq -r .node_id")
+if [ -n "$stale_node" ] && [ "$(docker exec "$PFX-$stale_node" sh -c 'grep -c "submitted unseal share" /var/log/autohsm-watch.log')" -ge 1 ] &&
+  docker exec "$PFX-$stale_node" sh -c 'awk "/rejected the unseal key material/{f=1;next} f && /submitted unseal share/{bad=1} END{exit bad}" /var/log/autohsm-watch.log'; then
+  pass "$stale_node submitted nothing after vault rejected the key material"
+else fail "stale node kept submitting (node=$stale_node)"; fi
+
 echo "== alarms for fail-closed daemon exits"
-if docker exec "$PFX-alarms" grep -q '"event":"autohsm_failed"' /e2e/alarms.jsonl; then
+if docker exec "$PFX-alarms" grep -q '"event":"autohsm_failed"' /e2e/alarms-earlier.jsonl /e2e/alarms.jsonl; then
   pass "autohsm_failed alarm delivered when a daemon stops"
 else fail "no autohsm_failed alarm on daemon exit"; fi
 
 echo "== leak check: no plaintext share or root token in any daemon log or alarm"
-secrets=$(docker exec "$PFX-n1" jq -r '.keys_base64[], .keys[], .root_token' /e2e/secret/init.json)
+secrets=$(docker exec "$PFX-n1" sh -c "jq -r '.keys_base64[], .keys[], .root_token' /e2e/secret/init*.json")
 leak=0
 for n in "${NODES[@]}"; do
   logs=$(docker exec "$PFX-$n" sh -c 'cat /var/log/autohsm-*.log 2>/dev/null')
@@ -188,7 +215,7 @@ for n in "${NODES[@]}"; do
     if grep -qF -- "$s" <<<"$logs"; then leak=1; echo "  leaked in $n log"; fi
   done <<<"$secrets"
 done
-alarms=$(docker exec "$PFX-alarms" cat /e2e/alarms.jsonl)
+alarms=$(docker exec "$PFX-alarms" sh -c 'cat /e2e/alarms-earlier.jsonl /e2e/alarms.jsonl')
 while IFS= read -r s; do grep -qF -- "$s" <<<"$alarms" && { leak=1; echo "  leaked in alarm"; }; done <<<"$secrets"
 [ $leak = 0 ] && pass "no share/root-token material in $(wc -l <<<"$alarms" | tr -d ' ') alarms or daemon logs" || fail "secret material leaked"
 
