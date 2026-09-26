@@ -161,7 +161,11 @@ does not restart.
 | `autohsm wrap --index N` | Wrap one share for this node, from stdin. |
 | `autohsm selftest` | Verify config, TLS pin, HSM, and every share. |
 
-`status` exiting 2 is the cheapest possible monitor and needs no webhook:
+With `alarm.webhook_url` set, the daemon posts `vault_sealed` on every sealed poll,
+`vault_unreachable` on every failed poll, and `autohsm_failed` just before it exits on
+an error (HSM unavailable, PIN rejected, retry budget exhausted, unsafe layout).
+
+`status` never opens the HSM. Exiting 2 is the cheapest possible monitor and needs no webhook:
 
 ```
 */5 * * * * autohsm status >/dev/null 2>&1 || echo "vault sealed" | mail -s ALERT you@example.com
@@ -191,6 +195,16 @@ make test-integration \
 Use your platform's actual `libsofthsm2.so` path. The test creates its token under
 the test temporary directory and never touches the system SoftHSM token store.
 
+With Docker, two disposable harnesses exercise the whole system locally (they
+never contact a real Vault or host):
+
+```bash
+make e2e           # real non-dev Vault + 3 SoftHSM nodes: unseal, reseal, restart, 8 negative cases
+make deploy-check  # README steps + deploy/autohsm.service under systemd on Debian 12
+```
+
+See `VALIDATION.md` for what was verified and what was not.
+
 ## Status
 
 | Component | State |
@@ -200,7 +214,9 @@ the test temporary directory and never touches the system SoftHSM token store.
 | Vault client, TLS pinning, timeouts, body limits | tested, incl. negative cases |
 | Watcher loop, failure budget, alarm hook | tested |
 | PKCS#11 attribute/mechanism validation | unit tested |
-| PKCS#11 source against SoftHSM 2.7 | integration tested |
+| PKCS#11 source against SoftHSM 2.6/2.7 | integration + e2e tested |
+| Unseal against real Vault 1.20 (Shamir, 3 nodes) | e2e tested, incl. negative cases |
+| systemd unit + README install on Debian 12 | deploy-check tested |
 | **PKCS#11 source against production hardware** | **not yet exercised** |
 
 The PKCS#11 path is written against the v2.40 AES-GCM interface and is exercised
