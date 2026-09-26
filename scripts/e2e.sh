@@ -112,16 +112,28 @@ echo "== POSITIVE: episode latch survives a peer contributing first after an uno
 # daemon comes back it must recognise its latch as stale and contribute again.
 on n1 seal
 on n1 watch-bg
-wait_for 20 '.progress == 1' || true
-on n1 watch-stop
-sleep 1
-on n1 unseal-reset >/dev/null
-on n1 submit-raw 2 >/dev/null
-on n1 watch-bg
-on n3 watch-bg
-if wait_for 20 '.sealed == false'; then pass "stale per-episode latch cleared; vault unsealed"
-else fail "stale latch: n1 never re-contributed (progress $(field progress))"; fi
-for n in n1 n3; do on "$n" watch-stop; done
+latch_ok=0
+if wait_for 20 '.progress == 1'; then
+  on n1 watch-stop
+  sleep 1
+  # The precondition must hold or the check below proves nothing.
+  if docker exec "$PFX-n1" grep -q '^nonce:..*' /run/autohsm/submitted-shares; then
+    latch_ok=1
+    pass "latch setup: n1 contributed and persisted a nonce-keyed latch"
+  else fail "latch setup: n1 persisted no nonce-keyed latch"; fi
+else
+  fail "latch setup: n1 never contributed (progress $(field progress))"
+  on n1 watch-stop
+fi
+if [ $latch_ok = 1 ]; then
+  on n1 unseal-reset >/dev/null
+  on n1 submit-raw 2 >/dev/null
+  on n1 watch-bg
+  on n3 watch-bg
+  if wait_for 20 '.sealed == false'; then pass "stale per-episode latch cleared; vault unsealed"
+  else fail "stale latch: n1 never re-contributed (progress $(field progress))"; fi
+  for n in n1 n3; do on "$n" watch-stop; done
+fi
 sleep 2
 
 echo "== NEGATIVE cases: each must refuse, submit nothing, and leave vault sealed"
@@ -143,7 +155,7 @@ negative "tampered wrapped blob" n3 "$(on n3 mkbad tampered n3 3)" 78
 docker exec "$PFX-n3" cat /etc/autohsm/share-3.wrapped | docker exec -i "$PFX-n1" sh -c 'cat >/e2e/foreign-share.wrapped'
 negative "share copied from another node's HSM" n1 "$(on n1 mkbad foreign-share n3 3 3)" 78
 negative "wrong HSM PIN" n3 "$(on n3 mkbad wrong-pin n3 3)" 1
-negative "impostor vault (untrusted CA)" n3 "$(on n3 mkbad rogue-ca n3 3)" 124
+negative "vault cert from an untrusted CA" n3 "$(on n3 mkbad rogue-ca n3 3)" 124
 negative "node holds >= threshold shares" n3 "$(on n3 mkbad unsafe-layout n3 3)" 78
 cfg=$(on n3 mkbad missing-token n3 3)
 docker exec "$PFX-n3" mv /var/lib/softhsm/tokens /var/lib/softhsm/tokens.gone

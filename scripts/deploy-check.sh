@@ -86,7 +86,7 @@ else fail "systemd-analyze verify"; fi
 echo "== service unseals (node1 holds share 1; peers supply 2 and 3 by hand)"
 peer submit-raw 2 >/dev/null
 peer submit-raw 3 >/dev/null
-if wait_for 60 '.sealed == false'; then pass "systemd service contributed the final share; vault unsealed"
+if wait_for 60 '.sealed == false'; then pass "systemd service submitted its share; vault unsealed with two peer shares"
 else fail "service did not unseal (progress $(peer seal-status | jq .progress))"; host journalctl -u autohsm --no-pager | tail -20; fi
 [ "$(host systemctl is-active autohsm)" = active ] && pass "autohsm.service active under the shipped sandbox" || fail "service not active"
 
