@@ -143,6 +143,57 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now autohsm
 ```
 
+### Hardware HSMs
+
+The shipped unit is tuned for SoftHSM. Vendor PKCS#11 modules usually need more,
+and every relaxation below is a deliberate hole in the sandbox, so add only what
+your module demonstrably needs, in a drop-in (`systemctl edit autohsm`) rather than
+by editing the shipped unit:
+
+```ini
+[Service]
+# Client state, logs, or session caches the vendor library writes
+# (examples: Luna /usr/safenet/lunaclient, nShield /opt/nfast/kmdata,
+# YubiHSM connector config). ProtectSystem=strict makes everything else read-only.
+ReadWritePaths=/opt/vendor/client-state /var/log/vendor-hsm
+
+# FIPS-mode libraries that read /proc/sys/crypto/fips_enabled or other
+# non-process /proc files. The shipped unit uses ProcSubset=pid.
+ProcSubset=all
+
+# Network HSM clients (Luna Network HSM, nShield Connect, CloudHSM client)
+# that enumerate interfaces or routes via netlink.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
+# USB/PCIe tokens: PrivateDevices=no is already set; grant the device node's
+# group (from your udev rule) rather than running as root.
+SupplementaryGroups=hsm
+```
+
+For USB/PCIe tokens, install a udev rule that gives the device a dedicated group
+(for example `SUBSYSTEM=="usb", ATTRS{idVendor}=="1050", GROUP="hsm", MODE="0660"`
+for a YubiHSM 2) and add `autohsm` to that group; never loosen the device to 0666.
+
+Run `selftest` **under the same sandbox** as the service before enabling it, so a
+path, device, or syscall the sandbox blocks fails now rather than at the next
+reboot:
+
+```bash
+sudo systemd-run --pipe --wait --collect -p User=autohsm -p Group=autohsm \
+  -p NoNewPrivileges=yes -p ProtectSystem=strict -p ProtectHome=yes -p PrivateTmp=yes \
+  -p CapabilityBoundingSet= -p SystemCallArchitectures=native \
+  -p SystemCallFilter=@system-service -p SystemCallFilter=~@privileged \
+  -p ProtectProc=invisible -p ProcSubset=pid \
+  -p "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX" -p ReadOnlyPaths=/etc/autohsm \
+  /usr/local/bin/autohsm selftest --config /etc/autohsm/autohsm.yaml
+```
+
+Add the same `-p` properties you put in the drop-in. A wrong PIN exits 78 and is
+never retried, so a mistyped PIN cannot count a hardware token down to lockout.
+If the token or its session goes away while the daemon runs, it raises
+`hsm_unavailable`, reconnects with backoff (up to 5 minutes between attempts), and
+raises `hsm_recovered` when the session is back.
+
 During a partial distributed unseal, each daemon records accepted share indexes in
 `/run/autohsm`, keyed to the unseal nonce Vault returned when the share was accepted.
 This prevents resubmission after a daemon crash within the same unseal attempt, while a
@@ -161,9 +212,15 @@ does not restart.
 | `autohsm wrap --index N` | Wrap one share for this node, from stdin. |
 | `autohsm selftest` | Verify config, TLS pin, HSM, and every share. |
 
-With `alarm.webhook_url` set, the daemon posts `vault_sealed` on every sealed poll,
-`vault_unreachable` on every failed poll, and `autohsm_failed` just before it exits on
-an error (HSM unavailable, PIN rejected, retry budget exhausted, unsafe layout).
+With `alarm.webhook_url` set, the daemon posts:
+
+| Event | When |
+|---|---|
+| `vault_sealed` | every poll that finds Vault sealed |
+| `vault_unreachable` | every poll that cannot reach Vault |
+| `hsm_unavailable` / `hsm_recovered` | once when the HSM session is lost and cannot be re-opened / when it is back |
+| `shares_stale` | Vault rejected the key material itself (for example shares from before a re-init); the daemon stops submitting until restarted and repeats this alarm with backoff (up to hourly) instead of `vault_sealed` |
+| `autohsm_failed` | just before the daemon exits on an error (PIN rejected, HSM missing at startup, retry budget exhausted, unsafe layout) |
 
 `status` never opens the HSM. Exiting 2 is the cheapest possible monitor and needs no webhook:
 
