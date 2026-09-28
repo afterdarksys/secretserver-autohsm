@@ -8,7 +8,7 @@
 // Deps: none
 // Example: defer secure.Wipe(share); ...
 // Status: tested
-// License: proprietary
+// License: MIT
 // Provenance: original
 package secure
 

@@ -8,7 +8,7 @@
 // Deps: none (stdlib only)
 // Example: src, _ := keysource.NewSoftware(key); share, _ := src.Unwrap(ctx, blob, aad)
 // Status: tested
-// License: proprietary
+// License: MIT
 // Provenance: original
 package keysource
 

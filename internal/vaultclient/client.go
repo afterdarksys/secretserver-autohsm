@@ -9,7 +9,7 @@
 // Deps: none (stdlib only)
 // Example: c, _ := vaultclient.New(cfg); st, _ := c.SealStatus(ctx)
 // Status: tested
-// License: proprietary
+// License: MIT
 // Provenance: original
 package vaultclient
 

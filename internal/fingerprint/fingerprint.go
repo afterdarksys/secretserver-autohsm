@@ -8,7 +8,7 @@
 // Deps: none
 // Example: log.Printf("share %s unwrapped", fingerprint.Of(share))
 // Status: tested
-// License: proprietary
+// License: MIT
 // Provenance: original
 package fingerprint
 

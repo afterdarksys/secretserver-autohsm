@@ -9,7 +9,7 @@
 // Deps: none (stdlib only)
 // Example: a := alarm.New(cfg); a.SealedDetected(ctx, "node-a", status)
 // Status: tested
-// License: proprietary
+// License: MIT
 // Provenance: original
 package alarm
 

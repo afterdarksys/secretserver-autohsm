@@ -8,7 +8,7 @@
 // Deps: gopkg.in/yaml.v3
 // Example: cfg, err := config.Load("/etc/autohsm.yaml")
 // Status: tested
-// License: proprietary
+// License: MIT
 // Provenance: original
 package config
 

@@ -9,7 +9,7 @@
 // Deps: none beyond internal packages
 // Example: w := watch.New(client, source, opts); w.Run(ctx)
 // Status: tested
-// License: proprietary
+// License: MIT
 // Provenance: original
 package watch
 

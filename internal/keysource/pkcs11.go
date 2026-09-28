@@ -12,7 +12,7 @@
 // Status: tested — PKCS#11 v2.40 AES-GCM interface, exercised against SoftHSM 2.6/2.7 by
 // the integration test and scripts/e2e.sh; NOT yet exercised against production hardware,
 // so run `autohsm selftest` on the real token before trusting a deployment.
-// License: proprietary
+// License: MIT
 // Provenance: original
 package keysource
 
