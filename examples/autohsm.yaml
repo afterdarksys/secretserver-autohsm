@@ -3,11 +3,11 @@
 # Operator-assigned context label bound into every wrapped share. It prevents
 # accidental cross-node use but is not hardware identity; use a unique HSM key
 # per node for actual separation. Changing it requires re-wrapping the shares.
-node_id: apps2
+node_id: node-a
 
 vault:
   # Must be https. There is no plaintext option: shares cross the network.
-  address: https://apps2.afterdarksys.com:8200
+  address: https://vault-a.example.com:8200
   # The CA (or self-signed leaf) that signs Vault's certificate. Required —
   # there is deliberately no fallback to the system trust store.
   ca_cert_path: /etc/autohsm/vault-ca.pem
@@ -43,4 +43,4 @@ watch:
 alarm:
   # Optional. Must be https. Fires whenever a sealed Vault is observed, even if
   # the unseal then succeeds — so you learn Vault restarted.
-  # webhook_url: https://alerts.afterdarksys.com/hooks/vault-sealed
+  # webhook_url: https://alerts.example.com/hooks/vault-sealed

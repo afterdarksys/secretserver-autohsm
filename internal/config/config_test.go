@@ -11,9 +11,9 @@ import (
 )
 
 const validYAML = `
-node_id: apps2
+node_id: node-a
 vault:
-  address: https://apps2.afterdarksys.com:8200
+  address: https://vault-a.example.com:8200
   ca_cert_path: /etc/autohsm/vault-ca.pem
 keys:
   source: pkcs11
@@ -44,7 +44,7 @@ func TestLoadValidConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.NodeID != "apps2" || len(cfg.Keys.Shares) != 1 {
+	if cfg.NodeID != "node-a" || len(cfg.Keys.Shares) != 1 {
 		t.Fatalf("unexpected config: %+v", cfg)
 	}
 	// Defaults must be applied.
@@ -146,7 +146,7 @@ func TestLoadRejectsUnimplementedMetricsSetting(t *testing.T) {
 // Negative: plaintext Vault addresses must be refused — shares would cross the
 // network in the clear.
 func TestValidateRejectsPlaintextVaultAddress(t *testing.T) {
-	body := strings.Replace(validYAML, "https://apps2", "http://apps2", 1)
+	body := strings.Replace(validYAML, "https://vault-a", "http://vault-a", 1)
 	if _, err := Load(write(t, body, 0o600)); err == nil {
 		t.Fatal("plaintext vault address accepted")
 	}

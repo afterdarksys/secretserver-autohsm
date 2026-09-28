@@ -44,7 +44,7 @@ func TestExitCode(t *testing.T) {
 // lifetime of a long-running process.
 func TestBuildRejectsPinEnvForWatchDaemon(t *testing.T) {
 	const yaml = `
-node_id: apps2
+node_id: node-a
 vault:
   address: https://vault.example.com:8200
   ca_cert_path: /etc/autohsm/vault-ca.pem
@@ -125,7 +125,7 @@ func TestStatusDoesNotOpenHSM(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := fmt.Sprintf(`
-node_id: apps2
+node_id: node-a
 vault:
   address: %s
   ca_cert_path: %s

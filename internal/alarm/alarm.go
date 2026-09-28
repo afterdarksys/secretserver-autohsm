@@ -7,7 +7,7 @@
 // Does NOT guarantee delivery: a webhook is best-effort notification, not a substitute for
 // an external monitor polling seal-status independently.
 // Deps: none (stdlib only)
-// Example: a := alarm.New(cfg); a.SealedDetected(ctx, "apps2", status)
+// Example: a := alarm.New(cfg); a.SealedDetected(ctx, "node-a", status)
 // Status: tested
 // License: proprietary
 // Provenance: original

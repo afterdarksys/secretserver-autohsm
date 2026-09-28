@@ -102,11 +102,11 @@ func setup(t *testing.T, node string, idx int, plaintext string) (keysource.Sour
 }
 
 func TestUnsealsWhenSealed(t *testing.T) {
-	src, path := setup(t, "apps2", 1, "share-one")
+	src, path := setup(t, "node-a", 1, "share-one")
 	v := &fakeVault{sealed: true, initted: true, unsealAfter: 1}
 
 	w := New(v, src, Options{
-		NodeID: "apps2",
+		NodeID: "node-a",
 		Shares: []Share{{Index: 1, Path: path}},
 		Logger: quietLogger(),
 	})
@@ -124,10 +124,10 @@ func TestUnsealsWhenSealed(t *testing.T) {
 // A partial distributed unseal is stateful. Once this node's share has been
 // accepted, subsequent polls must wait for peers instead of resubmitting it.
 func TestDoesNotResubmitAcceptedShareWhileStillSealed(t *testing.T) {
-	src, path := setup(t, "apps2", 1, "share-one")
+	src, path := setup(t, "node-a", 1, "share-one")
 	v := &fakeVault{sealed: true, initted: true}
 	w := New(v, src, Options{
-		NodeID: "apps2", Shares: []Share{{Index: 1, Path: path}}, Logger: quietLogger(),
+		NodeID: "node-a", Shares: []Share{{Index: 1, Path: path}}, Logger: quietLogger(),
 	})
 
 	for i := 0; i < 3; i++ {
@@ -141,10 +141,10 @@ func TestDoesNotResubmitAcceptedShareWhileStillSealed(t *testing.T) {
 }
 
 func TestSubmissionLatchResetsAfterObservedUnseal(t *testing.T) {
-	src, path := setup(t, "apps2", 1, "share-one")
+	src, path := setup(t, "node-a", 1, "share-one")
 	v := &fakeVault{sealed: true, initted: true}
 	w := New(v, src, Options{
-		NodeID: "apps2", Shares: []Share{{Index: 1, Path: path}}, Logger: quietLogger(),
+		NodeID: "node-a", Shares: []Share{{Index: 1, Path: path}}, Logger: quietLogger(),
 	})
 
 	if err := w.Tick(context.Background()); err != nil {
@@ -164,11 +164,11 @@ func TestSubmissionLatchResetsAfterObservedUnseal(t *testing.T) {
 }
 
 func TestSubmissionLatchSurvivesDaemonRestart(t *testing.T) {
-	src, path := setup(t, "apps2", 1, "share-one")
+	src, path := setup(t, "node-a", 1, "share-one")
 	v := &fakeVault{sealed: true, initted: true}
 	statePath := filepath.Join(t.TempDir(), "submitted")
 	opts := Options{
-		NodeID: "apps2", Shares: []Share{{Index: 1, Path: path}}, StatePath: statePath, Logger: quietLogger(),
+		NodeID: "node-a", Shares: []Share{{Index: 1, Path: path}}, StatePath: statePath, Logger: quietLogger(),
 	}
 	if err := New(v, src, opts).Tick(context.Background()); err != nil {
 		t.Fatal(err)
@@ -182,14 +182,14 @@ func TestSubmissionLatchSurvivesDaemonRestart(t *testing.T) {
 }
 
 func TestZeroVaultProgressClearsPersistedLatch(t *testing.T) {
-	src, path := setup(t, "apps2", 1, "share-one")
+	src, path := setup(t, "node-a", 1, "share-one")
 	statePath := filepath.Join(t.TempDir(), "submitted")
 	if err := os.WriteFile(statePath, []byte("1\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	v := &fakeVault{sealed: true, initted: true}
 	w := New(v, src, Options{
-		NodeID: "apps2", Shares: []Share{{Index: 1, Path: path}}, StatePath: statePath, Logger: quietLogger(),
+		NodeID: "node-a", Shares: []Share{{Index: 1, Path: path}}, StatePath: statePath, Logger: quietLogger(),
 	})
 	if err := w.Tick(context.Background()); err != nil {
 		t.Fatal(err)
@@ -200,14 +200,14 @@ func TestZeroVaultProgressClearsPersistedLatch(t *testing.T) {
 }
 
 func TestMalformedSubmissionStateIsTerminal(t *testing.T) {
-	src, path := setup(t, "apps2", 1, "share-one")
+	src, path := setup(t, "node-a", 1, "share-one")
 	statePath := filepath.Join(t.TempDir(), "submitted")
 	if err := os.WriteFile(statePath, []byte("not-an-index\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	v := &fakeVault{sealed: true, initted: true}
 	w := New(v, src, Options{
-		NodeID: "apps2", Shares: []Share{{Index: 1, Path: path}}, StatePath: statePath, Logger: quietLogger(),
+		NodeID: "node-a", Shares: []Share{{Index: 1, Path: path}}, StatePath: statePath, Logger: quietLogger(),
 	})
 	if err := w.Tick(context.Background()); !errors.Is(err, ErrTerminal) {
 		t.Fatalf("malformed state was not terminal: %v", err)
@@ -221,11 +221,11 @@ func TestMalformedSubmissionStateIsTerminal(t *testing.T) {
 // to submit for an episode it never actually acted in -- a deadlock if no
 // other peer covers this node's share.
 func TestStaleLatchClearsOnNonceChangeEvenWithNonzeroProgress(t *testing.T) {
-	src, path := setup(t, "apps2", 1, "share-one")
+	src, path := setup(t, "node-a", 1, "share-one")
 	statePath := filepath.Join(t.TempDir(), "submitted")
 	v := &fakeVault{sealed: true, initted: true, nonce: "episode-A"}
 	opts := Options{
-		NodeID: "apps2", Shares: []Share{{Index: 1, Path: path}}, StatePath: statePath, Logger: quietLogger(),
+		NodeID: "node-a", Shares: []Share{{Index: 1, Path: path}}, StatePath: statePath, Logger: quietLogger(),
 	}
 
 	// Episode A: this node submits its share; the latch (and nonce) persist.
@@ -259,11 +259,11 @@ func TestStaleLatchClearsOnNonceChangeEvenWithNonzeroProgress(t *testing.T) {
 // reset, a peer contributing first left this node convinced it had already
 // contributed, and the unseal stalled below threshold.
 func TestLatchUsesNonceFromUnsealResponse(t *testing.T) {
-	src, path := setup(t, "apps2", 1, "share-one")
+	src, path := setup(t, "node-a", 1, "share-one")
 	statePath := filepath.Join(t.TempDir(), "submitted")
 	v := &fakeVault{sealed: true, initted: true, mintNonce: true}
 	opts := Options{
-		NodeID: "apps2", Shares: []Share{{Index: 1, Path: path}}, StatePath: statePath, Logger: quietLogger(),
+		NodeID: "node-a", Shares: []Share{{Index: 1, Path: path}}, StatePath: statePath, Logger: quietLogger(),
 	}
 
 	if err := New(v, src, opts).Tick(context.Background()); err != nil {
@@ -304,11 +304,11 @@ func TestLatchUsesNonceFromUnsealResponse(t *testing.T) {
 // contributed first to the new attempt left this node convinced it had
 // already contributed, and the unseal stalled one share short.
 func TestShareThatCompletesUnsealIsNotLatched(t *testing.T) {
-	src, path := setup(t, "apps2", 3, "share-three")
+	src, path := setup(t, "node-a", 3, "share-three")
 	statePath := filepath.Join(t.TempDir(), "submitted")
 	v := &fakeVault{sealed: true, initted: true, mintNonce: true, unsealAfter: 1}
 	w := New(v, src, Options{
-		NodeID: "apps2", Shares: []Share{{Index: 3, Path: path}}, StatePath: statePath, Logger: quietLogger(),
+		NodeID: "node-a", Shares: []Share{{Index: 3, Path: path}}, StatePath: statePath, Logger: quietLogger(),
 	})
 	if err := w.Tick(context.Background()); err != nil {
 		t.Fatal(err)
@@ -335,14 +335,14 @@ func TestShareThatCompletesUnsealIsNotLatched(t *testing.T) {
 // A latch persisted without a nonce (older state file) cannot belong to an
 // attempt that Vault identifies by a nonce, so it must not suppress this node.
 func TestNoncelessLatchIsStaleWhenVaultReportsNonce(t *testing.T) {
-	src, path := setup(t, "apps2", 1, "share-one")
+	src, path := setup(t, "node-a", 1, "share-one")
 	statePath := filepath.Join(t.TempDir(), "submitted")
 	if err := os.WriteFile(statePath, []byte("1\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	v := &fakeVault{sealed: true, initted: true, nonce: "peer-attempt", submitted: [][]byte{[]byte("peer")}}
 	w := New(v, src, Options{
-		NodeID: "apps2", Shares: []Share{{Index: 1, Path: path}}, StatePath: statePath, Logger: quietLogger(),
+		NodeID: "node-a", Shares: []Share{{Index: 1, Path: path}}, StatePath: statePath, Logger: quietLogger(),
 	})
 	if err := w.Tick(context.Background()); err != nil {
 		t.Fatal(err)
@@ -405,8 +405,8 @@ func (v *vaultish) SubmitUnsealShare(_ context.Context, share []byte) (*vaultcli
 // under the new nonce although that attempt only received share 2, and the
 // unseal stalled at 2/3.
 func TestLatchDropsIndexesFromEarlierAttemptMidPass(t *testing.T) {
-	src, p1 := setup(t, "apps2", 1, "share-one")
-	_, p2 := setup(t, "apps2", 2, "share-two")
+	src, p1 := setup(t, "node-a", 1, "share-one")
+	_, p2 := setup(t, "node-a", 2, "share-two")
 	v := &vaultish{sealed: true}
 	v.onSubmit = func(call int) {
 		if call == 1 { // Vault restarts right after accepting share 1
@@ -414,7 +414,7 @@ func TestLatchDropsIndexesFromEarlierAttemptMidPass(t *testing.T) {
 		}
 	}
 	w := New(v, src, Options{
-		NodeID: "apps2", Shares: []Share{{Index: 1, Path: p1}, {Index: 2, Path: p2}},
+		NodeID: "node-a", Shares: []Share{{Index: 1, Path: p1}, {Index: 2, Path: p2}},
 		StatePath: filepath.Join(t.TempDir(), "submitted"), Logger: quietLogger(),
 	})
 	if err := w.Tick(context.Background()); err != nil {
@@ -435,10 +435,10 @@ func TestLatchDropsIndexesFromEarlierAttemptMidPass(t *testing.T) {
 
 // Negative: an unsealed Vault must never receive shares.
 func TestDoesNothingWhenUnsealed(t *testing.T) {
-	src, path := setup(t, "apps2", 1, "share-one")
+	src, path := setup(t, "node-a", 1, "share-one")
 	v := &fakeVault{sealed: false, initted: true}
 
-	w := New(v, src, Options{NodeID: "apps2", Shares: []Share{{Index: 1, Path: path}}, Logger: quietLogger()})
+	w := New(v, src, Options{NodeID: "node-a", Shares: []Share{{Index: 1, Path: path}}, Logger: quietLogger()})
 	if err := w.Tick(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -450,10 +450,10 @@ func TestDoesNothingWhenUnsealed(t *testing.T) {
 // Negative: an uninitialised Vault means our shares are stale (it was re-inited).
 // Submitting them would be pointless and leaks share material to a fresh Vault.
 func TestRefusesUninitializedVault(t *testing.T) {
-	src, path := setup(t, "apps2", 1, "share-one")
+	src, path := setup(t, "node-a", 1, "share-one")
 	v := &fakeVault{sealed: true, initted: false}
 
-	w := New(v, src, Options{NodeID: "apps2", Shares: []Share{{Index: 1, Path: path}}, Logger: quietLogger()})
+	w := New(v, src, Options{NodeID: "node-a", Shares: []Share{{Index: 1, Path: path}}, Logger: quietLogger()})
 	if err := w.Tick(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -465,11 +465,11 @@ func TestRefusesUninitializedVault(t *testing.T) {
 // Negative: a share wrapped for a different configured node context must not be
 // submitted. This is an AAD integrity property, not physical host identity.
 func TestRefusesShareWrappedForAnotherNodeContext(t *testing.T) {
-	src, path := setup(t, "apps2", 1, "share-one")
+	src, path := setup(t, "node-a", 1, "share-one")
 	v := &fakeVault{sealed: true, initted: true}
 
-	// Same share file, but this watcher believes it is dr1.
-	w := New(v, src, Options{NodeID: "dr1", Shares: []Share{{Index: 1, Path: path}}, Logger: quietLogger()})
+	// Same share file, but this watcher believes it is node-b.
+	w := New(v, src, Options{NodeID: "node-b", Shares: []Share{{Index: 1, Path: path}}, Logger: quietLogger()})
 	if err := w.Tick(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -483,11 +483,11 @@ func TestRefusesShareWrappedForAnotherNodeContext(t *testing.T) {
 
 // Negative: repeated unseal failures must stop, not hammer Vault forever.
 func TestGivesUpAfterMaxAttempts(t *testing.T) {
-	src, path := setup(t, "apps2", 1, "share-one")
+	src, path := setup(t, "node-a", 1, "share-one")
 	v := &fakeVault{sealed: true, initted: true, submitErr: errors.New("vault rejects the key")}
 
 	w := New(v, src, Options{
-		NodeID:            "apps2",
+		NodeID:            "node-a",
 		Shares:            []Share{{Index: 1, Path: path}},
 		MaxUnsealAttempts: 3,
 		Logger:            quietLogger(),
@@ -505,10 +505,10 @@ func TestGivesUpAfterMaxAttempts(t *testing.T) {
 }
 
 func TestRefusesSingleNodeThresholdLayout(t *testing.T) {
-	src, path := setup(t, "apps2", 1, "share-one")
+	src, path := setup(t, "node-a", 1, "share-one")
 	v := &fakeVault{sealed: true, initted: true}
 	w := New(v, src, Options{
-		NodeID: "apps2",
+		NodeID: "node-a",
 		Shares: []Share{
 			{Index: 1, Path: path}, {Index: 2, Path: path}, {Index: 3, Path: path},
 		},
@@ -545,13 +545,13 @@ func TestValidateShareLayout(t *testing.T) {
 // not just log quietly. Otherwise an unreachable Vault (as opposed to a
 // confirmed-sealed one) can go unnoticed indefinitely.
 func TestAlarmFiresOnUnreachable(t *testing.T) {
-	src, path := setup(t, "apps2", 1, "share-one")
+	src, path := setup(t, "node-a", 1, "share-one")
 	v := &fakeVault{statusErr: errors.New("connection refused")}
 
 	var fired int
 	var gotErr error
 	w := New(v, src, Options{
-		NodeID: "apps2", Shares: []Share{{Index: 1, Path: path}},
+		NodeID: "node-a", Shares: []Share{{Index: 1, Path: path}},
 		Logger: quietLogger(),
 		OnUnreachable: func(pollErr error) {
 			fired++
@@ -571,11 +571,11 @@ func TestAlarmFiresOnUnreachable(t *testing.T) {
 
 // A transient status error must not consume the unseal budget.
 func TestStatusErrorDoesNotConsumeBudget(t *testing.T) {
-	src, path := setup(t, "apps2", 1, "share-one")
+	src, path := setup(t, "node-a", 1, "share-one")
 	v := &fakeVault{statusErr: errors.New("connection refused")}
 
 	w := New(v, src, Options{
-		NodeID: "apps2", Shares: []Share{{Index: 1, Path: path}},
+		NodeID: "node-a", Shares: []Share{{Index: 1, Path: path}},
 		MaxUnsealAttempts: 2, Logger: quietLogger(),
 	})
 	for i := 0; i < 5; i++ {
@@ -591,12 +591,12 @@ func TestStatusErrorDoesNotConsumeBudget(t *testing.T) {
 // The alarm hook must fire whenever a sealed Vault is observed, even if the
 // subsequent unseal fails — being loud is the whole point.
 func TestAlarmFiresOnSealed(t *testing.T) {
-	src, path := setup(t, "apps2", 1, "share-one")
+	src, path := setup(t, "node-a", 1, "share-one")
 	v := &fakeVault{sealed: true, initted: true, submitErr: errors.New("nope")}
 
 	var fired int
 	w := New(v, src, Options{
-		NodeID: "apps2", Shares: []Share{{Index: 1, Path: path}},
+		NodeID: "node-a", Shares: []Share{{Index: 1, Path: path}},
 		Logger:   quietLogger(),
 		OnSealed: func(*vaultclient.SealStatus) { fired++ },
 	})
@@ -632,13 +632,13 @@ func (c *fakeClock) now() time.Time          { return c.t }
 func (c *fakeClock) advance(d time.Duration) { c.t = c.t.Add(d) }
 
 func TestHSMOutageAlarmsOnceBacksOffAndRecovers(t *testing.T) {
-	sw, path := setup(t, "apps2", 1, "share-one")
+	sw, path := setup(t, "node-a", 1, "share-one")
 	src := &hsmSource{Source: sw, healthErr: fmt.Errorf("%w: CKR_DEVICE_REMOVED", keysource.ErrHSMUnavailable)}
 	v := &fakeVault{sealed: true, initted: true}
 	clk := &fakeClock{t: time.Unix(1_000_000, 0)}
 	var lost, recovered int
 	w := New(v, src, Options{
-		NodeID: "apps2", Shares: []Share{{Index: 1, Path: path}}, Interval: time.Second,
+		NodeID: "node-a", Shares: []Share{{Index: 1, Path: path}}, Interval: time.Second,
 		MaxUnsealAttempts: 1, Logger: quietLogger(), Now: clk.now,
 		OnHSMLost: func(error) { lost++ }, OnHSMRecovered: func() { recovered++ },
 	})
@@ -681,11 +681,11 @@ func TestHSMOutageAlarmsOnceBacksOffAndRecovers(t *testing.T) {
 // A lost HSM must be reported while Vault is still unsealed, not discovered
 // only at the next reboot.
 func TestHSMLossReportedWhileUnsealed(t *testing.T) {
-	sw, path := setup(t, "apps2", 1, "share-one")
+	sw, path := setup(t, "node-a", 1, "share-one")
 	src := &hsmSource{Source: sw, healthErr: keysource.ErrHSMUnavailable}
 	var lost int
 	w := New(&fakeVault{sealed: false, initted: true}, src, Options{
-		NodeID: "apps2", Shares: []Share{{Index: 1, Path: path}}, Logger: quietLogger(),
+		NodeID: "node-a", Shares: []Share{{Index: 1, Path: path}}, Logger: quietLogger(),
 		OnHSMLost: func(error) { lost++ },
 	})
 	if err := w.Tick(context.Background()); err != nil || lost != 1 {
@@ -697,7 +697,7 @@ func TestHSMLossReportedWhileUnsealed(t *testing.T) {
 // service manager does not retry and burn the token's PIN counter; an unusable
 // HSM configuration or key is terminal because retrying cannot fix it.
 func TestPINRejectionIsTerminal(t *testing.T) {
-	sw, path := setup(t, "apps2", 1, "share-one")
+	sw, path := setup(t, "node-a", 1, "share-one")
 	for name, src := range map[string]*hsmSource{
 		"pin health":           {Source: sw, healthErr: keysource.ErrPINRejected},
 		"pin unwrap":           {Source: sw, unwrapErr: keysource.ErrPINRejected},
@@ -705,7 +705,7 @@ func TestPINRejectionIsTerminal(t *testing.T) {
 		"misconfigured unwrap": {Source: sw, unwrapErr: fmt.Errorf("%w: key is unsafe", keysource.ErrHSMMisconfigured)},
 	} {
 		v := &fakeVault{sealed: true, initted: true}
-		w := New(v, src, Options{NodeID: "apps2", Shares: []Share{{Index: 1, Path: path}}, Logger: quietLogger(), MaxUnsealAttempts: 5})
+		w := New(v, src, Options{NodeID: "node-a", Shares: []Share{{Index: 1, Path: path}}, Logger: quietLogger(), MaxUnsealAttempts: 5})
 		if err := w.Tick(context.Background()); !errors.Is(err, ErrTerminal) {
 			t.Fatalf("%s: PIN rejection returned %v, want ErrTerminal", name, err)
 		}
@@ -716,11 +716,11 @@ func TestPINRejectionIsTerminal(t *testing.T) {
 }
 
 func TestUnwrapHSMLossDoesNotConsumeBudget(t *testing.T) {
-	sw, path := setup(t, "apps2", 1, "share-one")
+	sw, path := setup(t, "node-a", 1, "share-one")
 	src := &hsmSource{Source: sw, unwrapErr: fmt.Errorf("%w: CKR_SESSION_HANDLE_INVALID", keysource.ErrHSMUnavailable)}
 	var lost int
 	w := New(&fakeVault{sealed: true, initted: true}, src, Options{
-		NodeID: "apps2", Shares: []Share{{Index: 1, Path: path}}, Logger: quietLogger(),
+		NodeID: "node-a", Shares: []Share{{Index: 1, Path: path}}, Logger: quietLogger(),
 		MaxUnsealAttempts: 1, OnHSMLost: func(error) { lost++ },
 	})
 	if err := w.Tick(context.Background()); err != nil {
@@ -735,14 +735,14 @@ func TestUnwrapHSMLossDoesNotConsumeBudget(t *testing.T) {
 // The watcher must alarm shares_stale once, stop submitting for the life of
 // the process, stop per-poll vault_sealed alarms, and remind with backoff.
 func TestStaleSharesLatchFailsClosedWithBackoffAlarms(t *testing.T) {
-	src, path := setup(t, "apps2", 1, "share-one")
+	src, path := setup(t, "node-a", 1, "share-one")
 	rejected := &vaultclient.APIError{Method: "PUT", Path: "/v1/sys/unseal", StatusCode: 400, Status: "400 Bad Request",
 		Messages: []string{"unable to retrieve stored keys: invalid key: failed to decrypt keys from storage"}}
 	v := &fakeVault{sealed: true, initted: true, submitErr: rejected}
 	clk := &fakeClock{t: time.Unix(1_000_000, 0)}
 	var stale, sealed int
 	w := New(v, src, Options{
-		NodeID: "apps2", Shares: []Share{{Index: 1, Path: path}}, Interval: time.Second,
+		NodeID: "node-a", Shares: []Share{{Index: 1, Path: path}}, Interval: time.Second,
 		MaxUnsealAttempts: 1, Logger: quietLogger(), Now: clk.now,
 		OnSealed:      func(*vaultclient.SealStatus) { sealed++ },
 		OnSharesStale: func(*vaultclient.SealStatus, error) { stale++ },

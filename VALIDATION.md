@@ -3,7 +3,7 @@
 This file records what was verified on branch `prod-readiness-2026-09-26`, how it
 was verified, and what was not. Every result below came from a command run on that
 date; rerun the commands to reproduce them. Nothing touched a real Vault or any
-afterdarksys host. All Vault, HSM and systemd testing used disposable local Docker
+production host. All Vault, HSM and systemd testing used disposable local Docker
 containers.
 
 There were three rounds. The second round fixed issues raised by an independent

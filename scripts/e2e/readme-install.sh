@@ -23,7 +23,7 @@ install -o root -g autohsm -m 0640 /root/hsm-pin /etc/autohsm/pin
 cp deploy/autohsm.service /etc/systemd/system/
 
 # Operator edit: point the example config at this Vault.
-sed -i 's#address: https://apps2.afterdarksys.com:8200#address: https://vault:8200#' /etc/autohsm/autohsm.yaml
+sed -i 's#address: https://vault-a.example.com:8200#address: https://vault:8200#' /etc/autohsm/autohsm.yaml
 
 # --- README: Provision the HSM key and shares
 sudo usermod -aG softhsm autohsm

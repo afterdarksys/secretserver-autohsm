@@ -8,16 +8,16 @@ community-edition Vault that reboots stays sealed until a human types three keys
 
 ## Why this exists
 
-A sealed Vault is silent. Ours sat sealed for three months and nothing noticed — the
-symptom was a filtered port, the cause was a stale Docker network, and the effect was
-that secret storage simply did not work. This daemon addresses both halves:
+A sealed Vault is silent. It can stay sealed for months without anything noticing:
+the symptom looks like a filtered port or a network fault, and the effect is that
+secret storage simply does not work. This daemon addresses both halves:
 
 - **Availability** — Vault comes back unsealed after a reboot, without a human.
 - **Visibility** — every sealed observation fires an alarm, even when the unseal
   then succeeds, so you learn that Vault restarted at all.
 
 Of the two, the alarm matters more. Automation that fails silently is how you get
-another three-month outage.
+a months-long outage.
 
 ## Security model
 
@@ -71,9 +71,9 @@ With Vault at 5 shares / threshold 3, a sound layout is:
 
 | Node | Shares held |
 |---|---|
-| apps2 | 1 |
-| dr1 | 1 |
-| .229 | 1 |
+| node-a | 1 |
+| node-b | 1 |
+| node-c | 1 |
 
 Any two nodes surviving a reboot is not enough; all three must be up. That is the
 trade: availability against blast radius. Choose deliberately.
