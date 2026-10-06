@@ -7,6 +7,7 @@
 //	status    print Vault's current seal state and exit (exit 2 if sealed)
 //	wrap      wrap one unseal share for this node+index, reading plaintext from stdin
 //	selftest  verify config, CA pinning, HSM login, and that every share unwraps
+//	contribute submit this node's share to a pinned vaultkeeper generate-root or rekey
 package main
 
 import (
@@ -64,6 +65,8 @@ func main() {
 		err = runWrap(cfgPath, os.Args[2:])
 	case "selftest":
 		err = runSelftest(cfgPath, log)
+	case "contribute":
+		err = runContribute(cfgPath, os.Args[2:], log)
 	case "-h", "--help", "help":
 		usage()
 		return
@@ -108,7 +111,13 @@ usage:
   autohsm watch    [--config PATH]              run the daemon (systemd entrypoint)
   autohsm status   [--config PATH]              print seal state; exit 2 if sealed
   autohsm wrap     [--config PATH] --index N    wrap a share read from stdin
+  autohsm wrap     [--config PATH] --index N --install
+                                                wrap from stdin and atomically replace that
+                                                configured share file (vaultkeeper rekey)
   autohsm selftest [--config PATH]              verify config, TLS pin, HSM, and shares
+  autohsm contribute generate-root|rekey [--config PATH]
+                                                submit this node's share to a vaultkeeper
+                                                ceremony pinned to the configured PGP key(s)
 
 default config: `+defaultConfigPath+`
 `)
@@ -349,6 +358,7 @@ func runStatus(cfgPath string) error {
 // envelope. The plaintext is never echoed and is wiped before returning.
 func runWrap(cfgPath string, args []string) error {
 	index := 0
+	install := false
 	for i, a := range args {
 		if a == "--index" && i+1 < len(args) {
 			n, err := strconv.Atoi(args[i+1])
@@ -356,6 +366,9 @@ func runWrap(cfgPath string, args []string) error {
 				return fmt.Errorf("--index must be a number")
 			}
 			index = n
+		}
+		if a == "--install" {
+			install = true
 		}
 	}
 	if index < 1 {
@@ -398,6 +411,9 @@ func runWrap(cfgPath string, args []string) error {
 	}
 
 	fmt.Fprintf(os.Stderr, "wrapped share %d for node %q (%s)\n", index, cfg.NodeID, fingerprint.Of(share))
+	if install {
+		return installEnvelope(context.Background(), cfg, src, index, envelope)
+	}
 	fmt.Println(envelope)
 	return nil
 }

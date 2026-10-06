@@ -1,5 +1,6 @@
 // Asset: vault-seal-client
-// Purpose: Minimal, strictly-TLS-verified client for Vault's seal-status and unseal endpoints.
+// Purpose: Minimal, strictly-TLS-verified client for Vault's seal, unseal, generate-root,
+// rekey, and the few token/sys endpoints vaultkeeper needs.
 // Threats: Protects unseal key shares in transit against interception and against an
 // impersonated Vault (a forged endpoint that harvests shares). Enforces a pinned CA pool,
 // TLS >= 1.2 with no InsecureSkipVerify path, bounded response bodies, and request
@@ -170,10 +171,18 @@ func (c *Client) SubmitUnsealShare(ctx context.Context, share []byte) (*SealStat
 // json.Marshal on a string would leave an immutable plaintext copy of the share
 // in the Go heap.
 func marshalUnsealRequest(share []byte) ([]byte, error) {
+	return marshalKeyRequest(share, "")
+}
+
+// marshalKeyRequest builds {"key":"<share>"} or, with a nonce,
+// {"key":"<share>","nonce":"<nonce>"} (the generate-root and rekey update
+// bodies) in one wipeable buffer. The nonce must already have passed
+// validNonce, so it needs no escaping.
+func marshalKeyRequest(share []byte, nonce string) ([]byte, error) {
 	if !utf8.Valid(share) {
 		return nil, fmt.Errorf("unseal share is not valid UTF-8")
 	}
-	body := make([]byte, 0, len(share)+10)
+	body := make([]byte, 0, len(share)+len(nonce)+24)
 	body = append(body, '{', '"', 'k', 'e', 'y', '"', ':', '"')
 	const hex = "0123456789abcdef"
 	for _, b := range share {
@@ -198,11 +207,24 @@ func marshalUnsealRequest(share []byte) ([]byte, error) {
 			}
 		}
 	}
-	body = append(body, '"', '}')
+	body = append(body, '"')
+	if nonce != "" {
+		body = append(body, `,"nonce":"`...)
+		body = append(body, nonce...)
+		body = append(body, '"')
+	}
+	body = append(body, '}')
 	return body, nil
 }
 
 func (c *Client) do(ctx context.Context, method, path string, body []byte, out any) error {
+	return c.doToken(ctx, method, path, nil, body, out)
+}
+
+// doToken is do with an optional Vault token. The token is key material: it is
+// only ever placed in the X-Vault-Token header and never in an error. A nil out
+// accepts any 2xx reply (Vault answers many writes with 204 No Content).
+func (c *Client) doToken(ctx context.Context, method, path string, token []byte, body []byte, out any) error {
 	var rdr io.Reader
 	if body != nil {
 		rdr = bytes.NewReader(body)
@@ -213,6 +235,14 @@ func (c *Client) do(ctx context.Context, method, path string, body []byte, out a
 	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
+	}
+	if token != nil {
+		if err := validToken(token); err != nil {
+			return err
+		}
+		// Header values are strings, so this makes one immutable copy of the
+		// token for the lifetime of the request. Unavoidable with net/http.
+		req.Header.Set("X-Vault-Token", string(token))
 	}
 
 	resp, err := c.http.Do(req)
@@ -227,6 +257,8 @@ func (c *Client) do(ctx context.Context, method, path string, body []byte, out a
 	if err != nil {
 		return fmt.Errorf("read response: %w", err)
 	}
+	// Ceremony and login replies carry tokens or encrypted shares.
+	defer secure.Wipe(raw)
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		apiErr := &APIError{Method: method, Path: path, StatusCode: resp.StatusCode, Status: resp.Status}
@@ -242,6 +274,9 @@ func (c *Client) do(ctx context.Context, method, path string, body []byte, out a
 			}
 		}
 		return apiErr
+	}
+	if out == nil {
+		return nil
 	}
 	if err := json.Unmarshal(raw, out); err != nil {
 		return fmt.Errorf("decode response: %w", err)

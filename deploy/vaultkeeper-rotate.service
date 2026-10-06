@@ -1,0 +1,49 @@
+[Unit]
+Description=vaultkeeper — rotate the Vault barrier key with a narrow AppRole (never root)
+Documentation=https://github.com/afterdarksys/secretserver-autohsm
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# The AppRole policy grants update+sudo on sys/rotate and read on
+# sys/key-status only. The secret_id lives in /etc/vaultkeeper/secret-id,
+# root-owned 0600; vaultkeeper refuses a looser file.
+ExecStart=/usr/local/bin/vaultkeeper rotate-keyring --config /etc/vaultkeeper/vaultkeeper.yaml
+# A config or alarm setup failure cannot alarm (there is no notifier yet): it
+# is logged at error level to the journal and the unit enters the failed
+# state. Monitor that, for example with `systemctl is-failed
+# vaultkeeper-rotate.service` from your monitoring, or an OnFailure= unit:
+# OnFailure=notify-failure@%n.service   (put it in [Unit] via a drop-in)
+
+# Root only for file ownership; no capabilities at all.
+User=root
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+UMask=0077
+ReadOnlyPaths=/etc/vaultkeeper
+LimitCORE=0
+TimeoutStartSec=5min

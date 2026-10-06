@@ -42,6 +42,25 @@ type Config struct {
 	Keys  KeysConfig  `yaml:"keys"`
 	Watch WatchConfig `yaml:"watch"`
 	Alarm AlarmConfig `yaml:"alarm"`
+
+	// Vaultkeeper pins the operator PGP keys that `autohsm contribute` will
+	// release this node's share towards. Optional for the watch daemon;
+	// contribute refuses outright when the relevant pin is missing.
+	Vaultkeeper VaultkeeperConfig `yaml:"vaultkeeper"`
+}
+
+// VaultkeeperConfig pins which PGP keys a generate-root or rekey ceremony may
+// encrypt its result to. Vault's ceremony endpoints can be reachable without
+// authentication, so the pin, not the caller, is the security boundary: an
+// attempt locked to any other key (or to an OTP) never receives a share.
+type VaultkeeperConfig struct {
+	// PGPFingerprint is the operator key. A generate-root attempt must be
+	// locked to it, and rekey shares 1-4 must be encrypted to it.
+	PGPFingerprint string `yaml:"pgp_fingerprint"`
+	// OfflineFingerprint is the offline key rekey share 5 must be encrypted
+	// to. Together the two pins fix the exact ordered rekey layout
+	// [operator, operator, operator, operator, offline].
+	OfflineFingerprint string `yaml:"offline_fingerprint"`
 }
 
 // VaultConfig describes the Vault endpoint to keep unsealed.
@@ -300,7 +319,56 @@ func (c *Config) Validate() error {
 	if c.Alarm.WebhookURL != "" && !strings.HasPrefix(c.Alarm.WebhookURL, "https://") {
 		return fmt.Errorf("alarm.webhook_url must be https")
 	}
+	return c.Vaultkeeper.validate()
+}
+
+// validate normalizes the pins in place (lowercase hex) and rejects anything
+// that is not a full 40-hex-character v4 fingerprint. Short key IDs are
+// refused: they are collidable.
+func (v *VaultkeeperConfig) validate() error {
+	for _, f := range []struct {
+		name string
+		p    *string
+	}{{"pgp_fingerprint", &v.PGPFingerprint}, {"offline_fingerprint", &v.OfflineFingerprint}} {
+		if *f.p == "" {
+			continue
+		}
+		fp, err := NormalizePGPFingerprint(*f.p)
+		if err != nil {
+			return fmt.Errorf("vaultkeeper.%s: %w", f.name, err)
+		}
+		*f.p = fp
+	}
+	if v.OfflineFingerprint != "" && v.OfflineFingerprint == v.PGPFingerprint {
+		return fmt.Errorf("vaultkeeper.offline_fingerprint must differ from pgp_fingerprint")
+	}
 	return nil
+}
+
+// pgpFingerprintLen is a v4 OpenPGP fingerprint (SHA-1, 20 bytes) in hex,
+// which is the form Vault reports for pgp_fingerprint(s).
+const pgpFingerprintLen = 40
+
+// NormalizePGPFingerprint returns fp as 40 lowercase hex characters, or an
+// error. Spaces, a 0x prefix, and short or long key IDs are all rejected
+// rather than guessed at.
+func NormalizePGPFingerprint(fp string) (string, error) {
+	if len(fp) != pgpFingerprintLen {
+		return "", fmt.Errorf("must be exactly %d hex characters (a full v4 fingerprint), got %d characters", pgpFingerprintLen, len(fp))
+	}
+	out := make([]byte, pgpFingerprintLen)
+	for i := 0; i < len(fp); i++ {
+		c := fp[i]
+		switch {
+		case c >= '0' && c <= '9', c >= 'a' && c <= 'f':
+			out[i] = c
+		case c >= 'A' && c <= 'F':
+			out[i] = c + ('a' - 'A')
+		default:
+			return "", fmt.Errorf("must be hex only")
+		}
+	}
+	return string(out), nil
 }
 
 func (p PKCS11Config) validate() error {

@@ -1,17 +1,28 @@
 BINARY := autohsm
 PKG    := ./cmd/autohsm
 
-.PHONY: all build build-linux test test-integration e2e deploy-check vet clean
+.PHONY: all build build-linux test test-integration test-vaultkeeper e2e deploy-check vet clean
 
 all: vet test build
 
 build:
 	@mkdir -p bin
 	CGO_ENABLED=1 go build -trimpath -o bin/$(BINARY) $(PKG)
+	CGO_ENABLED=0 go build -trimpath -o bin/vaultkeeper ./cmd/vaultkeeper
 
 # Security-domain code: the suite is negative-test heavy by policy.
+# Includes the real-Vault vaultkeeper integration tests when `vault` and
+# `gpg` are installed (they skip, saying so, otherwise).
 test:
-	go test -timeout 120s -race ./...
+	go test -timeout 600s -race ./...
+
+# Real Vault binary + gpg (skipped with a message when either is missing):
+# root-task, SIGTERM-after-decrypt, rekey, forged/substituted results,
+# rotate-keyring, attacker attempts, and a secret-leak grep over all captured
+# output. VAULTKEEPER_TEST_VAULT=/path/to/vault picks another Vault release
+# (for example a checksum-verified 1.15 unpacked in a temp dir).
+test-vaultkeeper:
+	VAULTKEEPER_TEST_VAULT="$(VAULTKEEPER_TEST_VAULT)" go test -count=1 -timeout 600s -run TestIntegration -v ./cmd/vaultkeeper
 
 # Provisions an isolated temporary token and exercises the real PKCS#11 path.
 # Example macOS module: /usr/local/opt/softhsm/lib/softhsm/libsofthsm2.so

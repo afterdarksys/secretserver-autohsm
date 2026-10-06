@@ -299,3 +299,74 @@ func TestReadBoundedUsesOneBufferAndRejectsOversize(t *testing.T) {
 		t.Fatalf("exact-limit read: %q %v", b, err)
 	}
 }
+
+const (
+	testOperatorFP = "600E44AD55F1D7C04F52946AB051837018556301"
+	testOfflineFP  = "151d8ce90777db86be03e5eefb15cc9a4992b487"
+)
+
+func TestLoadVaultkeeperPinsNormalized(t *testing.T) {
+	cfg, err := Load(write(t, validYAML+`
+vaultkeeper:
+  pgp_fingerprint: `+testOperatorFP+`
+  offline_fingerprint: `+testOfflineFP+`
+`, 0o600))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := strings.ToLower(testOperatorFP)
+	if cfg.Vaultkeeper.PGPFingerprint != want || cfg.Vaultkeeper.OfflineFingerprint != testOfflineFP {
+		t.Fatalf("pins %+v", cfg.Vaultkeeper)
+	}
+}
+
+// The section is optional: the watch daemon does not need pins.
+func TestLoadWithoutVaultkeeperSection(t *testing.T) {
+	cfg, err := Load(write(t, validYAML, 0o600))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Vaultkeeper.PGPFingerprint != "" || cfg.Vaultkeeper.OfflineFingerprint != "" {
+		t.Fatalf("unexpected pins: %+v", cfg.Vaultkeeper)
+	}
+}
+
+// Negative: anything that is not a full 40-hex fingerprint is rejected at
+// load, so a typo'd or collidable pin can never reach contribute.
+func TestLoadRejectsMalformedPins(t *testing.T) {
+	bad := map[string]string{
+		"short key id":     "B051837018556301",
+		"39 chars":         testOfflineFP[:39],
+		"41 chars":         testOfflineFP + "0",
+		"non-hex":          "z" + testOfflineFP[1:],
+		"spaced":           "600E 44AD 55F1 D7C0 4F52  946A B051 8370 1855 6301",
+		"0x prefix":        "0x" + testOfflineFP[:38],
+		"v5 64-char":       strings.Repeat("ab", 32),
+		"trailing newline": testOfflineFP[:39] + "\n",
+	}
+	for name, fp := range bad {
+		t.Run(name, func(t *testing.T) {
+			for _, key := range []string{"pgp_fingerprint", "offline_fingerprint"} {
+				body := validYAML + "vaultkeeper:\n  " + key + ": \"" + strings.ReplaceAll(fp, "\n", `\n`) + "\"\n"
+				if _, err := Load(write(t, body, 0o600)); err == nil {
+					t.Fatalf("malformed %s %q accepted", key, fp)
+				}
+			}
+		})
+	}
+}
+
+// Share 5 must never open with the operator key.
+func TestLoadRejectsOfflineEqualToOperator(t *testing.T) {
+	body := validYAML + "vaultkeeper:\n  pgp_fingerprint: " + testOfflineFP + "\n  offline_fingerprint: " + strings.ToUpper(testOfflineFP) + "\n"
+	if _, err := Load(write(t, body, 0o600)); err == nil {
+		t.Fatal("offline pin equal to operator pin accepted")
+	}
+}
+
+func TestLoadRejectsRemovedAllowlistField(t *testing.T) {
+	body := validYAML + "vaultkeeper:\n  rekey_fingerprints: [" + testOfflineFP + "]\n"
+	if _, err := Load(write(t, body, 0o600)); err == nil {
+		t.Fatal("unordered allowlist accepted; the layout must be pinned exactly")
+	}
+}

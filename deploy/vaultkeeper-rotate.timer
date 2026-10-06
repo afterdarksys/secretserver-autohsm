@@ -1,0 +1,14 @@
+[Unit]
+Description=Rotate the Vault barrier key roughly every 30 days (vaultkeeper rotate-keyring)
+Documentation=https://github.com/afterdarksys/secretserver-autohsm
+
+[Timer]
+# Monthly is 28-31 days. Persistent catches up a run missed while the host
+# was down; the random delay keeps it out of everyone's midnight.
+OnCalendar=monthly
+RandomizedDelaySec=6h
+Persistent=true
+Unit=vaultkeeper-rotate.service
+
+[Install]
+WantedBy=timers.target

@@ -44,3 +44,11 @@ alarm:
   # Optional. Must be https. Fires whenever a sealed Vault is observed, even if
   # the unseal then succeeds — so you learn Vault restarted.
   # webhook_url: https://alerts.example.com/hooks/vault-sealed
+
+# Optional: pins for vaultkeeper ceremonies (autohsm contribute). Without a
+# pin, contribute refuses. Full 40-hex v4 fingerprints only. Together they fix
+# the only rekey layout a node accepts: shares 1-4 to the operator key,
+# share 5 to the offline key, in that order.
+# vaultkeeper:
+#   pgp_fingerprint: 0123456789ABCDEF0123456789ABCDEF01234567      # operator key
+#   offline_fingerprint: 89ABCDEF0123456789ABCDEF0123456789ABCDEF  # offline share-5 key
