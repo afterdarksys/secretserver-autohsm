@@ -1,0 +1,10 @@
+{
+  "token_policies": ["vaultkeeper-rotate"],
+  "token_type": "service",
+  "token_ttl": "5m",
+  "token_max_ttl": "5m",
+  "token_num_uses": 6,
+  "token_bound_cidrs": ["192.0.2.10/32"],
+  "secret_id_bound_cidrs": ["192.0.2.10/32"],
+  "secret_id_num_uses": 0
+}

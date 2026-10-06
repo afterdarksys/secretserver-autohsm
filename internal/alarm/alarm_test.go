@@ -2,6 +2,7 @@ package alarm
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"io"
@@ -159,5 +160,59 @@ func TestHSMAndStaleSharePayloads(t *testing.T) {
 	if !strings.Contains(got[0].Error, "CKR_DEVICE_REMOVED") || got[1].Error != "" ||
 		!strings.Contains(got[2].Error, "invalid key") || got[2].Threshold != 3 || !got[2].Sealed {
 		t.Fatalf("payload contents wrong: %+v", got)
+	}
+}
+
+func TestCeremonyPayloads(t *testing.T) {
+	var got []Payload
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var p Payload
+		if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+			t.Errorf("decode payload: %v", err)
+		}
+		got = append(got, p)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	n, err := NewWithClient(srv.URL, srv.Client(), discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n.client.CheckRedirect(nil, nil) != http.ErrUseLastResponse {
+		t.Fatal("NewWithClient dropped the no-redirect policy")
+	}
+	n.Contributed(context.Background(), "node-a", "generate-root", "f4fef122", 2, 3)
+	n.ContributeRefused(context.Background(), "node-b", "rekey", errors.New("fingerprint not allowlisted"))
+	n.Event(context.Background(), "vaultkeeper_keyring_rotated", "vaultkeeper", "term=4")
+	if len(got) != 3 {
+		t.Fatalf("got %d payloads", len(got))
+	}
+	if g := got[0]; g.Event != "contribute" || g.Op != "generate-root" || g.Nonce != "f4fef122" || g.Progress != 2 || g.Threshold != 3 {
+		t.Fatalf("contribute payload %+v", g)
+	}
+	if g := got[1]; g.Event != "contribute_refused" || g.NodeID != "node-b" || !strings.Contains(g.Error, "allowlisted") {
+		t.Fatalf("refused payload %+v", g)
+	}
+	if g := got[2]; g.Event != "vaultkeeper_keyring_rotated" || g.Detail != "term=4" {
+		t.Fatalf("event payload %+v", g)
+	}
+}
+
+// Alarm clients never negotiate below TLS 1.3.
+func TestAlarmClientsRequireTLS13(t *testing.T) {
+	n, _ := New("https://alerts.example/hook", discardLogger())
+	m, _ := NewWithClient("https://alerts.example/hook", &http.Client{Transport: &http.Transport{}}, discardLogger())
+	for _, x := range []*Notifier{n, m} {
+		tr, ok := x.client.Transport.(*http.Transport)
+		if !ok || tr.TLSClientConfig == nil || tr.TLSClientConfig.MinVersion != tls.VersionTLS13 {
+			t.Fatal("alarm transport does not require TLS 1.3")
+		}
+	}
+}
+
+func TestNewWithClientStillRequiresHTTPS(t *testing.T) {
+	if _, err := NewWithClient("http://alerts.example/hook", http.DefaultClient, discardLogger()); err == nil {
+		t.Fatal("plaintext webhook accepted")
 	}
 }

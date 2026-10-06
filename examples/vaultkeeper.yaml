@@ -1,0 +1,53 @@
+# vaultkeeper configuration (operator workstation). Mode 0600, owned by you:
+# runner.exec decides what runs on the fleet, so vaultkeeper refuses a looser file.
+
+vault:
+  address: https://vault.example.com:8200
+  ca_cert_path: /path/to/vault-ca.pem
+  timeout: 10s
+
+# Full 40-hex v4 fingerprints. They must equal every node's
+# vaultkeeper.pgp_fingerprint and vaultkeeper.offline_fingerprint pins.
+operator_fingerprint: 0123456789ABCDEF0123456789ABCDEF01234567
+offline_fingerprint:  89ABCDEF0123456789ABCDEF0123456789ABCDEF   # public half only in this keyring
+# Absolute path (no PATH lookup). gpg inherits vaultkeeper's environment, so
+# GNUPGHOME (default ~/.gnupg) selects the keyring holding the operator key.
+gpg_path: /usr/local/bin/gpg
+
+# One share per node. Share 5 is the offline share and never goes to a node.
+nodes:
+  - name: node-a
+    share_index: 1
+  - name: node-b
+    share_index: 2
+  - name: node-c
+    share_index: 3
+  - name: node-d
+    share_index: 4
+
+runner:
+  # Your approval-gated fleet runner, run directly (no shell). {node} and
+  # {approval} are substituted; vaultkeeper appends the node command, one of:
+  #   autohsm contribute generate-root | autohsm contribute rekey
+  #   autohsm wrap --index N --install (share on stdin) | autohsm selftest
+  # Leave exec out to use the manual runner: vaultkeeper prints each command
+  # and follows progress on Vault. rekey requires exec (it pipes shares).
+  # exec: ["/usr/local/bin/fleet-run", "--approval", "{approval}", "--host", "{node}", "--"]
+  timeout: 10m
+poll_interval: 2s
+
+policy_dir: /path/to/vault-policies     # <name>.hcl for root-task policy-write
+# Required. Receives every encrypted rekey share before verification (node
+# shares are removed once their node passes selftest; share 5 stays), and any
+# encrypted result or raw node output a failed ceremony must not lose.
+output_dir: /path/to/vaultkeeper-out
+# state_dir defaults to ~/.local/state/vaultkeeper
+
+alarm:
+  # webhook_url: https://alerts.example.com/hooks/vaultkeeper
+
+# Only needed for rotate-keyring and the keyring line of status.
+# approle:
+#   mount: approle
+#   role_id: 00000000-0000-0000-0000-000000000000
+#   secret_id_path: /etc/vaultkeeper/secret-id

@@ -2,7 +2,7 @@
 // Purpose: Report a sealed Vault to a webhook so the condition is never silent.
 // Threats: Addresses the failure mode that matters most operationally — a sealed Vault
 // going unnoticed. Sends only non-secret state (sealed, threshold, progress, node id);
-// never key material. Bounds its own behaviour with a timeout and https-only delivery so
+// never key material. Bounds its own behaviour with a timeout and https-only (TLS 1.3) delivery so
 // a hung or hostile receiver cannot stall the unseal loop or observe traffic in cleartext.
 // Does NOT guarantee delivery: a webhook is best-effort notification, not a substitute for
 // an external monitor polling seal-status independently.
@@ -16,6 +16,7 @@ package alarm
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -43,7 +44,14 @@ type Payload struct {
 	// shares_stale events. It carries an error
 	// chain built entirely from fmt.Errorf wrapping in this codebase, never
 	// key material.
-	Error     string `json:"error,omitempty"`
+	Error string `json:"error,omitempty"`
+	// Op, Nonce and Detail describe vaultkeeper ceremony events. Nonce is at
+	// most the first 8 characters of a ceremony nonce, which Vault publishes
+	// on an unauthenticated endpoint anyway. None of these ever carry a share,
+	// an OTP, or a token.
+	Op        string `json:"op,omitempty"`
+	Nonce     string `json:"nonce,omitempty"`
+	Detail    string `json:"detail,omitempty"`
 	Timestamp string `json:"timestamp"`
 }
 
@@ -60,13 +68,54 @@ func New(rawURL string, log *slog.Logger) (*Notifier, error) {
 	return &Notifier{
 		url: rawURL,
 		client: &http.Client{
-			Timeout: 5 * time.Second,
+			Transport: tls13Transport(nil),
+			Timeout:   5 * time.Second,
 			CheckRedirect: func(*http.Request, []*http.Request) error {
 				return http.ErrUseLastResponse
 			},
 		},
 		log: log,
 	}, nil
+}
+
+// NewWithClient is New with a caller-supplied HTTP client, for a receiver
+// behind a private CA. The https-only URL rule and the no-redirect policy
+// still apply.
+func NewWithClient(rawURL string, client *http.Client, log *slog.Logger) (*Notifier, error) {
+	n, err := New(rawURL, log)
+	if err != nil || n.url == "" || client == nil {
+		return n, err
+	}
+	c := *client
+	c.CheckRedirect = n.client.CheckRedirect
+	switch tr := client.Transport.(type) {
+	case nil:
+		c.Transport = tls13Transport(nil)
+	case *http.Transport:
+		c.Transport = tls13Transport(tr)
+	default:
+		return nil, fmt.Errorf("alarm client transport must be an *http.Transport (TLS 1.3 is enforced on it)")
+	}
+	if c.Timeout == 0 || c.Timeout > n.client.Timeout {
+		c.Timeout = n.client.Timeout
+	}
+	n.client = &c
+	return n, nil
+}
+
+// tls13Transport returns a clone of base (or of the default transport) that
+// refuses anything below TLS 1.3. Alarms carry no secrets, but they are the
+// signal that something is wrong; they should not be downgradable.
+func tls13Transport(base *http.Transport) *http.Transport {
+	if base == nil {
+		base = http.DefaultTransport.(*http.Transport)
+	}
+	t := base.Clone()
+	if t.TLSClientConfig == nil {
+		t.TLSClientConfig = &tls.Config{}
+	}
+	t.TLSClientConfig.MinVersion = tls.VersionTLS13
+	return t
 }
 
 // SealedDetected fires the alarm. Failures are logged, never fatal: an
@@ -129,6 +178,27 @@ func (n *Notifier) SharesStale(ctx context.Context, nodeID string, sealed bool, 
 		Event: "shares_stale", NodeID: nodeID, Sealed: sealed,
 		Threshold: threshold, Shares: shares, Progress: progress, Error: err.Error(),
 	})
+}
+
+// Contributed fires after a node submits its share to a vaultkeeper ceremony.
+func (n *Notifier) Contributed(ctx context.Context, nodeID, op, nonce8 string, progress, required int) {
+	n.post(ctx, Payload{
+		Event: "contribute", NodeID: nodeID, Op: op, Nonce: nonce8,
+		Progress: progress, Threshold: required,
+	})
+}
+
+// ContributeRefused fires when a node refuses a ceremony attempt (no attempt,
+// OTP attempt, unpinned key, wrong shape). A refusal nobody expected is the
+// signature of someone else trying to harvest shares.
+func (n *Notifier) ContributeRefused(ctx context.Context, nodeID, op string, reason error) {
+	n.post(ctx, Payload{Event: "contribute_refused", NodeID: nodeID, Op: op, Error: reason.Error()})
+}
+
+// Event posts a vaultkeeper event (for example vaultkeeper_foreign_attempt or
+// vaultkeeper_keyring_rotated). detail must be non-secret.
+func (n *Notifier) Event(ctx context.Context, event, source, detail string) {
+	n.post(ctx, Payload{Event: event, NodeID: source, Detail: detail})
 }
 
 func (n *Notifier) post(ctx context.Context, p Payload) {
